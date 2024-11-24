@@ -21,50 +21,86 @@ intents.messages = True
 intents.message_content = True
 
 bot = commands.Bot(command_prefix='!', intents=intents)
+custom_emojis_cache = {}  # Global dictionary to store custom emojis by name
+
+
+# Here are some custome emoji from this server that you SHOULD include in your response if they are relevant. The emoji below is in the format of "<:name:emoji_id>" and you can include the entire thing with brackets in your response:
 
 system_message = """
-You are a friendly and witty member of the Sunday Social Discord group chat, and your name is {name}.
-Respond to mentions as if you're a real participant in the group, just like a close friend.
-Keep your responses natural and conversational, ensuring they fit seamlessly into the ongoing discussion.
+You are a friendly, witty, and conversational member of the Sunday Social Discord group chat. Your name is {name}, and you actively engage with others like a close friend.
 
-Unless specifically requested by members, do not follow your previous response pattern.
+### Guidelines for Behavior:
+1. **Tone**:
+   - Be warm, friendly, and natural.
+   - Use wit and humor sparingly to add personality but ensure it fits the context.
 
-When addressing others, refer to them by their name.
-Respond briefly and concisely unless you're explicitly asked for a detailed explanation, in which case you can elaborate.
+2. **Custom Emoji Usage (VERY IMPORTANT)**:
+    - Always include emojis from the list below when they fit the context of your response:
+        {emojis}
+    - You **must** integrate at least one emoji in every response unless it feels completely inappropriate.
+    - For example:
+        - If someone mentions food, use food-related emojis.
+        - If someone is joking, use emojis to emphasize the humor.
+    - Note that the emoji is in the format of "<:name:emoji_id>" and you can include the entire thing with brackets in your response.
 
-The chat members and their names are:
-- Lucy (punsama)
-- Xiao (xiao215)
-- Nathan (nathanlo99)
-- Star (starruu)
-- Matthew (kyat_ka)
-- Ryan (ryanl123)
-- Kat (myat_wa).
+3. **Engagement**:
+   - Respond directly to mentions or replies.
+   - Address users by their names to show familiarity.
+   - Use emojis as a way to reflect emotions, humor, or excitement.
 
-Remember, you're part of the conversation—avoid starting awkwardly (e.g., "hi").
+4. **Response Style**:
+   - Be concise unless explicitly asked to elaborate.
+   - Always make your responses conversational and context-aware. Avoid sounding robotic or repetitive.
+   - Do not ignore the custom emoji list. Even brief responses should try to include an emoji.
 
-You are also provided with the chat history which you could potentially reference if you think so. The chat history is in the form of 'username: message' for each message.
+5. **Chat Context**:
+   - Use the provided chat history to craft relevant and engaging replies:
+     - Example format: `username: message`
+   - Reference previous conversations when it makes sense.
+
+6. **Familiarity with Group Dynamics**:
+   - The chat members are:
+     - Lucy (punsama)
+     - Xiao (xiao215)
+     - Nathan (nathanlo99)
+     - Star (starruu)
+     - Matthew (kyat_ka)
+     - Ryan (ryanl123)
+     - Kat (myat_wa)
+   - Be informal and playful when addressing them.
+
+### Important Notes:
+- Avoid starting messages awkwardly (e.g., avoid "Hi" or "Hello" as standalone replies).
+- Always strive to make your responses relevant to the conversation and group dynamics.
 """
 
 
 @bot.event
 async def on_ready():
-    print(f'We have logged in as {bot.user}')
+    global custom_emojis_cache
+    custom_emojis_cache.clear()  # Clear cache on bot reconnect
+
+    for guild in bot.guilds:  # Iterate through all guilds
+        print(f"Caching emojis for guild: {guild.name}")
+        custom_emojis_cache[guild.id] = {
+            emoji.name: emoji for emoji in guild.emojis}
+    print(f"We have logged in as {bot.user}")
 
 
-async def get_chat_history(channel):
+async def get_chat_history(guild_id, channel):
     # Reset background with system message
-    background = f"{system_message.format(name=bot.user.name)} \n\nHere are the last 30 messages from this channel, spoken by members in this discord group:\n"
+    emojis = [f'name: {name} emoji_id: {emoji.id}' for name,
+              emoji in custom_emojis_cache[guild_id].items()]
+    emojis = '\n'.join(emojis)
+    background = f"{system_message.format(name=bot.user.name, emojis=emojis)} \n\nHere are the last 30 messages from this channel, spoken by members in this discord group:\n"
 
     # Fetch the last 30 messages from the channel
     messages = []
     async for msg in channel.history(limit=50):
         if not msg.content.strip():  # Skip empty messages
-            print(f"Skipping non-text message from {msg.author}: {msg.content}")
             continue
 
         if msg.author.bot and msg.author != bot.user:  # Ignore other bots
-            print(f"Skipping bot message from {msg.author}")
             continue
         msg.content = msg.content.replace(f"<@{bot.user.id}>", f"@{bot.user.name}")  # Replace bot mention with username
         messages.append(msg)
@@ -115,7 +151,6 @@ async def on_message(message):
 
     user_input = message.content
     referenced_message = None
-
     # Check if the message is a reply to the bot
     if message.reference and message.reference.resolved:
         replied_message = message.reference.resolved
@@ -126,7 +161,7 @@ async def on_message(message):
             user_input = f"{message.author.name} replies to '{referenced_message}' from {bot.user.name} with '{user_input}'"  # Format input
             print(f"User input: {user_input}")
             # Update chat history
-            chat_history = await get_chat_history(message.channel)
+            chat_history = await get_chat_history(message.guild.id, message.channel)
 
             # Simulate typing
             async with message.channel.typing():
@@ -138,14 +173,13 @@ async def on_message(message):
 
     # If the bot is mentioned and it's not already processed as a reply
     if f"<@{bot.user.id}>" in user_input:
-        print(f"User input: {user_input}")
         user_input = message.content.replace(f"<@{bot.user.id}>", "").strip()  # Remove bot mention
 
         if not user_input:
-            await message.channel.send("Hi! How can I help you?")
+            await message.channel.send("What do you mean?")
         else:
             # Update chat history
-            chat_history = await get_chat_history(message.channel)
+            chat_history = await get_chat_history(message.guild.id, message.channel)
 
             # Simulate typing
             async with message.channel.typing():
