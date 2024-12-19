@@ -10,10 +10,11 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 COHERE_API_KEY_1 = os.getenv('COHERE_API_KEY_1')
 COHERE_API_KEY_2 = os.getenv('COHERE_API_KEY_2')
+COHERE_API_KEY_3 = os.getenv('COHERE_API_KEY_3')
 
 # Set up the Cohere client
-co_1 = cohere.ClientV2(api_key=COHERE_API_KEY_1)
-co_2 = cohere.ClientV2(api_key=COHERE_API_KEY_2)
+co_1 = cohere.ClientV2(api_key=COHERE_API_KEY_3)
+co_2 = cohere.ClientV2(api_key=COHERE_API_KEY_3)
 
 # Intents for the bot
 intents = discord.Intents.default()
