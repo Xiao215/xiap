@@ -1,0 +1,27 @@
+# Ignore environment files
+.env
+*.env
+
+# Ignore Python cache and compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pdb
+
+# Ignore logs and temporary files
+*.log
+*.tmp
+
+# Ignore Git-related files
+.git/
+.gitignore
+
+# Ignore Docker-related files
+.dockerignore
+Dockerfile
+
+# Ignore system files (macOS, VSCode, IDE settings, etc.)
+.DS_Store
+.vscode/
+.idea/
