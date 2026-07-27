@@ -17,8 +17,10 @@ class HelpCog(commands.Cog):
                 "and I know this server's custom emojis."
             ),
         )
+        tree = interaction.client.tree
         commands_list = sorted(
-            interaction.client.tree.get_commands(), key=lambda c: c.name
+            tree.get_commands(guild=interaction.guild) or tree.get_commands(),
+            key=lambda c: c.name,
         )
         lines = [
             f"`/{c.name}` — {c.description}" for c in commands_list if c.name != "help"

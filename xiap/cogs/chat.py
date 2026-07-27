@@ -170,9 +170,10 @@ class ChatCog(commands.Cog):
     async def _build_context(self, channel: discord.abc.Messageable, guild: discord.Guild | None) -> str:
         # str(emoji) yields the exact sendable token: <:name:id> or <a:name:id> for animated.
         emojis = "\n".join(str(e) for e in (guild.emojis if guild else ()))
+        commands_list = self.bot.tree.get_commands(guild=guild) or self.bot.tree.get_commands()
         features = "\n".join(
             f"/{c.name} — {c.description}"
-            for c in sorted(self.bot.tree.get_commands(), key=lambda c: c.name)
+            for c in sorted(commands_list, key=lambda c: c.name)
         )
         prompt = SYSTEM_PROMPT.format(
             name=self.bot.user.name,

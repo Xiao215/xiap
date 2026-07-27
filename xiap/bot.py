@@ -26,6 +26,8 @@ class XiapBot(commands.Bot):
         intents = discord.Intents.default()
         intents.message_content = True
         super().__init__(command_prefix="!", intents=intents)
+        self._synced = False
+        self._all_commands: list = []
 
     async def setup_hook(self) -> None:
         await start_health_server(config.PORT)
@@ -34,11 +36,28 @@ class XiapBot(commands.Bot):
                 await self.load_extension(cog)
             except Exception:
                 log.exception("Failed to load extension %s", cog)
-        synced = await self.tree.sync()
-        log.info("Synced %d slash commands", len(synced))
 
     async def on_ready(self) -> None:
         log.info("Logged in as %s (%d guilds)", self.user, len(self.guilds))
+        if self._synced:
+            return
+        self._synced = True
+        # Register commands per guild: guild commands update instantly, while
+        # global ones can take up to an hour to propagate to clients.
+        self._all_commands = self.tree.get_commands()
+        for guild in self.guilds:
+            self.tree.copy_global_to(guild=guild)
+            synced = await self.tree.sync(guild=guild)
+            log.info("Synced %d commands to %s", len(synced), guild.name)
+        # Remove the old global registrations so commands don't appear twice.
+        self.tree.clear_commands(guild=None)
+        await self.tree.sync()
+
+    async def on_guild_join(self, guild: discord.Guild) -> None:
+        for cmd in self._all_commands:
+            self.tree.add_command(cmd, guild=guild)
+        await self.tree.sync(guild=guild)
+        log.info("Joined %s, synced commands", guild.name)
 
 
 async def main() -> None:
