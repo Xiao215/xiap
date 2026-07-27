@@ -14,6 +14,7 @@ import discord
 from discord.ext import commands
 
 from xiap import config
+from xiap.store import store
 
 log = logging.getLogger(__name__)
 
@@ -179,11 +180,20 @@ class ChatCog(commands.Cog):
             features=features,
         )
 
+        if not store.context_enabled(channel.id):
+            return (
+                prompt
+                + "\n\n(Reading channel history is turned off in this channel via /context, "
+                + "so you only see the message that pinged you. Don't guess at prior conversation.)"
+            )
+
         history: list[str] = []
         async for msg in channel.history(limit=config.CHAT_HISTORY_LIMIT):
             if not msg.content.strip():
                 continue
             if msg.author.bot and msg.author != self.bot.user:
+                continue
+            if store.is_opted_out(msg.author.id):
                 continue
             content = msg.content.replace(f"<@{self.bot.user.id}>", f"@{self.bot.user.name}")
             history.append(f"{msg.author.display_name}: {content}")
@@ -210,6 +220,13 @@ class ChatCog(commands.Cog):
 
         if not (is_reply_to_me or is_mention):
             return
+
+        log.info(
+            "Chat trigger from %s in #%s (%s)",
+            message.author.display_name,
+            getattr(message.channel, "name", "?"),
+            "reply" if is_reply_to_me else "mention",
+        )
 
         if not content:
             await message.channel.send("What do you mean?")

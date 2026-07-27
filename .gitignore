@@ -125,3 +125,5 @@ dmypy.json
 # Windows
 Thumbs.db
 ehthumbs.db
+# Bot settings (runtime data)
+data.json

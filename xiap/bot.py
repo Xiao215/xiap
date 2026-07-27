@@ -14,6 +14,7 @@ COGS = (
     "xiap.cogs.chat",
     "xiap.cogs.fun",
     "xiap.cogs.help",
+    "xiap.cogs.privacy",
     "xiap.cogs.polls",
     "xiap.cogs.reminders",
     "xiap.cogs.newsletter",
