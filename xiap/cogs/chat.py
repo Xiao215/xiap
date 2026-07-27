@@ -6,6 +6,7 @@ and automatic failover between providers.
 """
 
 import logging
+import re
 
 import aiohttp
 import cohere
@@ -31,7 +32,7 @@ Your name is {name}, and you actively engage with others like a close friend.
 - Always include emojis from the list below when they fit the context of your response:
 {emojis}
 - You **must** integrate at least one emoji in every response unless it feels completely inappropriate.
-- Note that the emoji is in the format "<:name:emoji_id>" and you should include the entire thing, brackets included, in your response.
+- Copy the emoji token EXACTLY as written above, including the angle brackets and the number, e.g. "<:name:123456789>" or "<a:name:123456789>" for animated ones. Never write the ":name:" shorthand — it will not render.
 
 3. **Engagement**:
 - Respond directly to mentions or replies.
@@ -144,8 +145,25 @@ class ChatCog(commands.Cog):
                 log.error("Provider %s failed: %s", name, e)
         return "My brain is fried right now, try again in a bit 😵"
 
+    # Matches a full emoji token (kept/canonicalized) or bare :name: shorthand (fixed up).
+    EMOJI_RE = re.compile(r"<a?:(\w+):\d+>|:(\w+):")
+
+    @classmethod
+    def _fix_emojis(cls, text: str, guild: discord.Guild | None) -> str:
+        """Repair model emoji mistakes: ':name:' shorthand and wrong ids/animated prefixes."""
+        if guild is None:
+            return text
+        by_name = {e.name: e for e in guild.emojis}
+
+        def repl(m: re.Match) -> str:
+            emoji = by_name.get(m.group(1) or m.group(2))
+            return str(emoji) if emoji else m.group(0)
+
+        return cls.EMOJI_RE.sub(repl, text)
+
     async def _build_context(self, channel: discord.abc.Messageable, guild: discord.Guild | None) -> str:
-        emojis = "\n".join(f"name: {e.name} emoji_id: {e.id}" for e in (guild.emojis if guild else ()))
+        # str(emoji) yields the exact sendable token: <:name:id> or <a:name:id> for animated.
+        emojis = "\n".join(str(e) for e in (guild.emojis if guild else ()))
         prompt = SYSTEM_PROMPT.format(name=self.bot.user.name, emojis=emojis or "(no custom emojis)")
 
         history: list[str] = []
@@ -195,6 +213,7 @@ class ChatCog(commands.Cog):
         system = await self._build_context(message.channel, message.guild)
         async with message.channel.typing():
             response = await self._query(system, user_prompt)
+        response = self._fix_emojis(response, message.guild)
         await message.reply(response[:2000], mention_author=False)
 
 
