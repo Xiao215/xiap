@@ -8,18 +8,31 @@ load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
-# Cohere keys: either COHERE_API_KEYS="key1,key2" or COHERE_API_KEY_1, COHERE_API_KEY_2, ...
-def _load_cohere_keys() -> list[str]:
-    keys = [k.strip() for k in os.getenv("COHERE_API_KEYS", "").split(",") if k.strip()]
+
+def _load_keys(prefix: str) -> list[str]:
+    """Collect API keys: PREFIX_API_KEYS="k1,k2,..." and/or PREFIX_API_KEY_1, _2, ...
+
+    Any number of keys works — the bot rotates through all of them.
+    """
+    keys = [k.strip() for k in os.getenv(f"{prefix}_API_KEYS", "").split(",") if k.strip()]
+    if single := os.getenv(f"{prefix}_API_KEY"):
+        keys.append(single)
     i = 1
-    while key := os.getenv(f"COHERE_API_KEY_{i}"):
+    while key := os.getenv(f"{prefix}_API_KEY_{i}"):
         keys.append(key)
         i += 1
     return keys
 
 
-COHERE_API_KEYS = _load_cohere_keys()
-COHERE_MODEL = os.getenv("COHERE_MODEL", "command-a-03-2025")
+# Chat providers. "auto" prefers Gemini (higher free-tier limits) and falls back
+# to Cohere; set CHAT_PROVIDER=cohere or =gemini to force one as primary.
+CHAT_PROVIDER = os.getenv("CHAT_PROVIDER", "auto").lower()
+
+COHERE_API_KEYS = _load_keys("COHERE")
+COHERE_MODEL = os.getenv("COHERE_MODEL", "command-a-plus-05-2026")
+
+GEMINI_API_KEYS = _load_keys("GEMINI")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 
 # How many recent channel messages to feed the model as context.
 CHAT_HISTORY_LIMIT = int(os.getenv("CHAT_HISTORY_LIMIT", "30"))

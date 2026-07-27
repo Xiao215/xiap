@@ -4,7 +4,7 @@ A friendly AI Discord bot for the Sunday Social group chat. Mention it (or reply
 
 ## Features
 
-**AI chat** — @mention the bot or reply to one of its messages and it responds in character, using the last 30 messages of the channel as context and your server's custom emojis.
+**AI chat** — @mention the bot or reply to one of its messages and it responds in character, using the last 30 messages of the channel as context and your server's custom emojis. Powered by Gemini Flash (free tier) and/or Cohere — configure either or both; keys round-robin and providers fail over automatically.
 
 **Slash commands**
 
@@ -23,7 +23,7 @@ A friendly AI Discord bot for the Sunday Social group chat. Mention it (or reply
 ## Setup
 
 1. Create a bot at the [Discord Developer Portal](https://discord.com/developers/applications). Under **Bot**, enable the **Message Content Intent** and copy the token.
-2. Get one or more free API keys from [Cohere](https://dashboard.cohere.com/api-keys).
+2. Get a free Gemini API key from [Google AI Studio](https://aistudio.google.com/apikey) and/or Cohere keys from the [Cohere dashboard](https://dashboard.cohere.com/api-keys).
 3. Configure and run:
 
 ```bash
