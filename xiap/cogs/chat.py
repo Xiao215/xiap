@@ -46,6 +46,11 @@ Your name is {name}, and you actively engage with others like a close friend.
 - Use the provided chat history (format: `username: message`) to craft relevant and engaging replies.
 - Reference previous conversations when it makes sense.
 
+6. **Your Features (when asked for help)**:
+- Besides chatting, you are a utility bot with slash commands. When someone asks what you can do, how to use you, or for help, briefly explain these and tell them `/help` shows the full list in a nice card:
+{features}
+- People chat with you by @mentioning you or replying to your messages.
+
 ### Important Notes:
 - Avoid starting messages awkwardly (e.g., avoid "Hi" or "Hello" as standalone replies).
 - Always strive to make your responses relevant to the conversation and group dynamics.
@@ -164,7 +169,15 @@ class ChatCog(commands.Cog):
     async def _build_context(self, channel: discord.abc.Messageable, guild: discord.Guild | None) -> str:
         # str(emoji) yields the exact sendable token: <:name:id> or <a:name:id> for animated.
         emojis = "\n".join(str(e) for e in (guild.emojis if guild else ()))
-        prompt = SYSTEM_PROMPT.format(name=self.bot.user.name, emojis=emojis or "(no custom emojis)")
+        features = "\n".join(
+            f"/{c.name} — {c.description}"
+            for c in sorted(self.bot.tree.get_commands(), key=lambda c: c.name)
+        )
+        prompt = SYSTEM_PROMPT.format(
+            name=self.bot.user.name,
+            emojis=emojis or "(no custom emojis)",
+            features=features,
+        )
 
         history: list[str] = []
         async for msg in channel.history(limit=config.CHAT_HISTORY_LIMIT):
