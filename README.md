@@ -10,15 +10,13 @@ A friendly AI Discord bot for the Sunday Social group chat. Mention it (or reply
 
 | Command | What it does |
 |---|---|
-| `/rps [opponent]` | Rock-paper-scissors vs the bot — or duel a friend with secret picks and a dramatic reveal |
+| `/stock [symbol] [period]` | Price chart image for any ticker (default: SPY / S&P 500), data from Yahoo Finance |
 | `/poll` | Button-based poll (up to 5 options) with a live results bar |
 | `/remind 1h30m <text>` | Pings you in the channel when time's up |
-| `/roll 2d6` | Roll dice in standard notation |
-| `/8ball <question>` | The magic 8-ball knows all |
-| `/coinflip` | Heads or tails |
 | `/choose a, b, c` | Can't decide? The bot picks |
-| `/ship @a @b` | Compatibility meter 💘 (consistent per pair, order-independent) |
-| `/subscribe`, `/unsubscribe` | Newsletter channel subscriptions (requires Firestore; auto-disabled without it) |
+| `/context on\|off` | Per-channel toggle: whether the AI may read recent channel history |
+| `/optout`, `/optin` | Per-user: exclude your messages from AI context everywhere |
+| `/help` | Feature overview card, generated from the live command list |
 
 ## Setup
 
