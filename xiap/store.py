@@ -12,12 +12,15 @@ PATH = Path(os.getenv("DATA_FILE", "data.json"))
 
 class Store:
     def __init__(self) -> None:
-        self.context_off: set[int] = set()  # channel ids with history reading disabled
+        self.context_limit: dict[int, int] = {}  # channel id -> max history messages (unset = default)
         self.optout: set[int] = set()  # user ids excluded from AI context
         self.paper_subs: dict[int, str] = {}  # channel id -> topic filter ("" = all)
         try:
             data = json.loads(PATH.read_text())
-            self.context_off = set(data.get("context_off", []))
+            self.context_limit = {int(k): v for k, v in data.get("context_limit", {}).items()}
+            # Migrate the old on/off format: "off" channels become a limit of 0.
+            for channel_id in data.get("context_off", []):
+                self.context_limit.setdefault(int(channel_id), 0)
             self.optout = set(data.get("optout", []))
             self.paper_subs = {int(k): v for k, v in data.get("paper_subs", {}).items()}
         except FileNotFoundError:
@@ -28,7 +31,7 @@ class Store:
     def _save(self) -> None:
         PATH.write_text(
             json.dumps({
-                "context_off": sorted(self.context_off),
+                "context_limit": {str(k): v for k, v in self.context_limit.items()},
                 "optout": sorted(self.optout),
                 "paper_subs": {str(k): v for k, v in self.paper_subs.items()},
             })
@@ -43,12 +46,12 @@ class Store:
         self._save()
         return existed
 
-    def set_context(self, channel_id: int, enabled: bool) -> None:
-        (self.context_off.discard if enabled else self.context_off.add)(channel_id)
+    def set_context_limit(self, channel_id: int, limit: int) -> None:
+        self.context_limit[channel_id] = limit
         self._save()
 
-    def context_enabled(self, channel_id: int) -> bool:
-        return channel_id not in self.context_off
+    def get_context_limit(self, channel_id: int, default: int) -> int:
+        return self.context_limit.get(channel_id, default)
 
     def set_optout(self, user_id: int, opted_out: bool) -> None:
         (self.optout.add if opted_out else self.optout.discard)(user_id)

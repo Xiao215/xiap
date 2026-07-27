@@ -14,19 +14,20 @@ from xiap.store import store
 class PrivacyCog(commands.Cog):
     @app_commands.command(
         name="context",
-        description="Turn the AI's reading of this channel's recent messages on or off",
+        description="Set how many recent messages the AI may read in this channel (0 = none)",
     )
-    @app_commands.choices(mode=[
-        app_commands.Choice(name="on", value="on"),
-        app_commands.Choice(name="off", value="off"),
-    ])
-    async def context(self, interaction: discord.Interaction, mode: app_commands.Choice[str]) -> None:
-        enabled = mode.value == "on"
-        store.set_context(interaction.channel.id, enabled)
-        if enabled:
-            msg = "🟢 Context is **on** here — when pinged, I'll read this channel's recent messages to reply better."
-        else:
+    @app_commands.describe(messages="Max past messages the AI sees when pinged here, 0-30 (default 30)")
+    async def context(
+        self, interaction: discord.Interaction, messages: app_commands.Range[int, 0, 30]
+    ) -> None:
+        store.set_context_limit(interaction.channel.id, messages)
+        if messages == 0:
             msg = "🔒 Context is **off** here — when pinged, I'll only see the message that pinged me, nothing else."
+        else:
+            msg = (
+                f"🟢 When pinged here, I'll read up to the last **{messages}** message"
+                f"{'s' if messages != 1 else ''} of this channel for context."
+            )
         await interaction.response.send_message(msg)
 
     @app_commands.command(

@@ -14,7 +14,7 @@ A friendly AI Discord bot for the Sunday Social group chat. Mention it (or reply
 | `/poll` | Button-based poll (up to 5 options) with a live results bar |
 | `/remind 1h30m <text>` | Pings you in the channel when time's up |
 | `/choose a, b, c` | Can't decide? The bot picks |
-| `/context on\|off` | Per-channel toggle: whether the AI may read recent channel history |
+| `/context 0-30` | Per-channel cap on how many recent messages the AI may read (0 = none) |
 | `/optout`, `/optin` | Per-user: exclude your messages from AI context everywhere |
 | `/help` | Feature overview card, generated from the live command list |
 

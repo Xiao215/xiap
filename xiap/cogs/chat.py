@@ -183,7 +183,8 @@ class ChatCog(commands.Cog):
             features=features,
         )
 
-        if not store.context_enabled(channel.id):
+        limit = store.get_context_limit(channel.id, config.CHAT_HISTORY_LIMIT)
+        if limit <= 0:
             return (
                 prompt
                 + "\n\n(Reading channel history is turned off in this channel via /context, "
@@ -191,7 +192,7 @@ class ChatCog(commands.Cog):
             )
 
         history: list[str] = []
-        async for msg in channel.history(limit=config.CHAT_HISTORY_LIMIT):
+        async for msg in channel.history(limit=limit):
             if not msg.content.strip():
                 continue
             if msg.author.bot and msg.author != self.bot.user:
