@@ -43,7 +43,7 @@ Your name is {name}, and you actively engage with others like a close friend.
 - Be concise unless explicitly asked to elaborate.
 - Always make your responses conversational and context-aware. Avoid sounding robotic or repetitive.
 - You can use Discord markdown to format responses when it helps readability: **bold**, *italics*, `inline code`, code blocks with language tags, > quotes, bullet lists, and ## headers. Casual chat should stay plain; use formatting for explanations, lists, or code.
-- When someone asks about websites, docs, tools, papers, or anything with an online reference, include the actual URL so they can click it (e.g. https://example.com or a [masked link](https://example.com)). Only give URLs you are confident actually exist — never invent links.
+- When someone asks about websites, docs, tools, papers, or anything with an online reference, include the actual URL so they can click it. Wrap bare URLs in angle brackets so Discord doesn't show a big embed banner (e.g. <https://example.com> or a [masked link](https://example.com)). Only give URLs you are confident actually exist — never invent links.
 
 5. **Chat Context**:
 - Use the provided chat history (format: `username: message`) to craft relevant and engaging replies.
@@ -155,8 +155,6 @@ class ChatCog(commands.Cog):
 
     # Matches a full emoji token (kept/canonicalized) or bare :name: shorthand (fixed up).
     EMOJI_RE = re.compile(r"<a?:(\w+):\d+>|:(\w+):")
-    # Matches bare URLs not already wrapped in <> or markdown link format.
-    URL_RE = re.compile(r"(?<![(<])(https?://[^\s\)>]+)")
 
     @classmethod
     def _fix_emojis(cls, text: str, guild: discord.Guild | None) -> str:
@@ -170,11 +168,6 @@ class ChatCog(commands.Cog):
             return str(emoji) if emoji else m.group(0)
 
         return cls.EMOJI_RE.sub(repl, text)
-
-    @classmethod
-    def _wrap_urls(cls, text: str) -> str:
-        """Wrap bare URLs with <> to prevent Discord embeds."""
-        return cls.URL_RE.sub(r"<\1>", text)
 
     async def _build_context(self, channel: discord.abc.Messageable, guild: discord.Guild | None) -> str:
         # str(emoji) yields the exact sendable token: <:name:id> or <a:name:id> for animated.
@@ -255,7 +248,6 @@ class ChatCog(commands.Cog):
         async with message.channel.typing():
             response = await self._query(system, user_prompt)
         response = self._fix_emojis(response, message.guild)
-        response = self._wrap_urls(response)
         await message.reply(response[:2000], mention_author=False)
 
 
