@@ -13,6 +13,7 @@ log = logging.getLogger(__name__)
 COGS = (
     "xiap.cogs.chat",
     "xiap.cogs.fun",
+    "xiap.cogs.help",
     "xiap.cogs.polls",
     "xiap.cogs.reminders",
     "xiap.cogs.newsletter",
