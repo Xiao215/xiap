@@ -37,5 +37,9 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 # How many recent channel messages to feed the model as context.
 CHAT_HISTORY_LIMIT = int(os.getenv("CHAT_HISTORY_LIMIT", "30"))
 
+# Daily papers digest: local hour to post at, and the timezone it's in.
+PAPERS_HOUR = int(os.getenv("PAPERS_HOUR", "9"))
+TIMEZONE = os.getenv("TIMEZONE", "America/Toronto")
+
 # Port for the tiny HTTP health-check server (Cloud Run & friends).
 PORT = int(os.getenv("PORT", "8080"))

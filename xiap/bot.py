@@ -16,6 +16,7 @@ COGS = (
     "xiap.cogs.help",
     "xiap.cogs.privacy",
     "xiap.cogs.stocks",
+    "xiap.cogs.papers",
     "xiap.cogs.polls",
     "xiap.cogs.reminders",
 )

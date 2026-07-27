@@ -14,10 +14,12 @@ class Store:
     def __init__(self) -> None:
         self.context_off: set[int] = set()  # channel ids with history reading disabled
         self.optout: set[int] = set()  # user ids excluded from AI context
+        self.paper_subs: dict[int, str] = {}  # channel id -> topic filter ("" = all)
         try:
             data = json.loads(PATH.read_text())
             self.context_off = set(data.get("context_off", []))
             self.optout = set(data.get("optout", []))
+            self.paper_subs = {int(k): v for k, v in data.get("paper_subs", {}).items()}
         except FileNotFoundError:
             pass
         except Exception:
@@ -25,8 +27,21 @@ class Store:
 
     def _save(self) -> None:
         PATH.write_text(
-            json.dumps({"context_off": sorted(self.context_off), "optout": sorted(self.optout)})
+            json.dumps({
+                "context_off": sorted(self.context_off),
+                "optout": sorted(self.optout),
+                "paper_subs": {str(k): v for k, v in self.paper_subs.items()},
+            })
         )
+
+    def set_paper_sub(self, channel_id: int, topic: str) -> None:
+        self.paper_subs[channel_id] = topic
+        self._save()
+
+    def remove_paper_sub(self, channel_id: int) -> bool:
+        existed = self.paper_subs.pop(channel_id, None) is not None
+        self._save()
+        return existed
 
     def set_context(self, channel_id: int, enabled: bool) -> None:
         (self.context_off.discard if enabled else self.context_off.add)(channel_id)
