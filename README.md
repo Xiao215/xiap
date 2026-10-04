@@ -17,6 +17,7 @@ A friendly AI Discord bot for the Sunday Social group chat. Mention it (or reply
 | `/remind 1h30m <text>` | Pings you in the channel when time's up |
 | `/choose a, b, c` | Can't decide? The bot picks |
 | `/context 0-30` | Per-channel cap on how many recent messages the AI may read (0 = none) |
+| `/models`, `/model` | See which AI models can answer you and pick one (per person; Claude is owner-only) |
 | `/optout`, `/optin` | Per-user: exclude your messages from AI context everywhere |
 | `/help` | Feature overview card, generated from the live command list |
 
@@ -62,6 +63,7 @@ xiap/
   web.py               aiohttp health-check server
   cogs/
     chat.py            AI chat (mentions & replies) and its context tools
+    models.py          /models, /model: per-user model choice
     fun.py             rps, roll, 8ball, coinflip, choose, ship
     polls.py           button polls
     reminders.py       /remind

@@ -226,7 +226,7 @@ class ChatCog(commands.Cog):
         if self.http:
             await self.http.close()
 
-    async def _is_owner(self, user: discord.abc.User) -> bool:
+    async def is_owner(self, user: discord.abc.User) -> bool:
         """OWNER_ID if set, else whoever owns the bot in the Developer Portal."""
         if config.OWNER_ID:
             return user.id == config.OWNER_ID
@@ -331,7 +331,7 @@ class ChatCog(commands.Cog):
 
         if not (is_reply_to_me or is_mention):
             return
-        owner = bool(self.agent.claude) and await self._is_owner(message.author)
+        owner = bool(self.agent.claude) and await self.is_owner(message.author)
         if not (self.agent.providers or owner):
             return
 
@@ -360,11 +360,19 @@ class ChatCog(commands.Cog):
         async with message.channel.typing():
             prompt = await self._user_prompt(ctx, replied if replied_ok else None, content)
             images = await self._images(message, replied if replied_ok else None)
-            response = await self.agent.run(
-                self._system_prompt(message.guild), prompt, ctx.tools(), images, owner=owner
+            pick = store.get_model_pick(message.author.id)
+            result = await self.agent.run(
+                self._system_prompt(message.guild), prompt, ctx.tools(), images, owner=owner, pick=pick
             )
-        response = response or "My brain is fried right now, try again in a bit 😵"
-        chunks = self._split_message(self._fix_emojis(response, message.guild))
+        if result is None:
+            response = "My brain is fried right now, try again in a bit 😵"
+        else:
+            response, answered_by = result
+            response = self._fix_emojis(response, message.guild)
+            if pick and answered_by != pick:
+                # Let them know their /model choice didn't answer (rate limit, outage…).
+                response += f"\n-# {pick} was unavailable, so {answered_by} answered"
+        chunks = self._split_message(response)
         await message.reply(chunks[0], mention_author=False)
         for chunk in chunks[1:]:
             await message.channel.send(chunk)

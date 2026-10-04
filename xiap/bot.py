@@ -14,6 +14,7 @@ COGS = (
     "xiap.cogs.chat",
     "xiap.cogs.fun",
     "xiap.cogs.help",
+    "xiap.cogs.models",
     "xiap.cogs.privacy",
     "xiap.cogs.stocks",
     "xiap.cogs.papers",

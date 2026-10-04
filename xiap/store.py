@@ -15,6 +15,7 @@ class Store:
         self.context_limit: dict[int, int] = {}  # channel id -> max history messages (unset = default)
         self.optout: set[int] = set()  # user ids excluded from AI context
         self.paper_subs: dict[int, str] = {}  # channel id -> topic filter ("" = all)
+        self.model_pick: dict[int, str] = {}  # user id -> "provider:model" for their AI replies
         try:
             data = json.loads(PATH.read_text())
             self.context_limit = {int(k): v for k, v in data.get("context_limit", {}).items()}
@@ -23,6 +24,7 @@ class Store:
                 self.context_limit.setdefault(int(channel_id), 0)
             self.optout = set(data.get("optout", []))
             self.paper_subs = {int(k): v for k, v in data.get("paper_subs", {}).items()}
+            self.model_pick = {int(k): v for k, v in data.get("model_pick", {}).items()}
         except FileNotFoundError:
             pass
         except Exception:
@@ -34,6 +36,7 @@ class Store:
                 "context_limit": {str(k): v for k, v in self.context_limit.items()},
                 "optout": sorted(self.optout),
                 "paper_subs": {str(k): v for k, v in self.paper_subs.items()},
+                "model_pick": {str(k): v for k, v in self.model_pick.items()},
             })
         )
 
@@ -45,6 +48,16 @@ class Store:
         existed = self.paper_subs.pop(channel_id, None) is not None
         self._save()
         return existed
+
+    def set_model_pick(self, user_id: int, pick: str | None) -> None:
+        if pick:
+            self.model_pick[user_id] = pick
+        else:
+            self.model_pick.pop(user_id, None)
+        self._save()
+
+    def get_model_pick(self, user_id: int) -> str | None:
+        return self.model_pick.get(user_id)
 
     def set_context_limit(self, channel_id: int, limit: int) -> None:
         self.context_limit[channel_id] = limit

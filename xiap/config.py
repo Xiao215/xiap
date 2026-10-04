@@ -33,6 +33,9 @@ COHERE_MODEL = os.getenv("COHERE_MODEL", "command-a-plus-05-2026")
 
 GEMINI_API_KEYS = _load_keys("GEMINI")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+# Gemini Pro models have no free-tier quota, so /models hides them unless your
+# key has billing enabled.
+GEMINI_LIST_PRO = os.getenv("GEMINI_LIST_PRO", "").lower() in ("1", "true", "yes")
 
 # Owner-only Claude: the bot owner's messages go to the owner's local
 # claude-api server (https://github.com/Xiao215/claude-api), which runs the

@@ -16,6 +16,8 @@ read-only, so re-running them on failover is harmless.
 import base64
 import json
 import logging
+import re
+import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
@@ -27,6 +29,11 @@ from xiap import config
 log = logging.getLogger(__name__)
 
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+GEMINI_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000"
+# The Gemini catalogue also lists TTS, image, music, robotics… models; keep the
+# chat ones: gemini-<version>-pro/flash/flash-lite, optionally -preview, and the -latest aliases.
+GEMINI_CHAT_RE = re.compile(r"^gemini-(\d[\d.]*-)?(pro|flash|flash-lite)(-preview)?(-latest)?$")
+MODEL_LIST_TTL = 3600  # seconds to cache the model lists
 
 # Tool results are truncated to this many characters so one call can't blow up the prompt.
 MAX_TOOL_RESULT_CHARS = 6000
@@ -115,28 +122,97 @@ class Agent:
             order = list(available)
         self.providers = [(name, available[name]) for name in order]
         log.info("Chat providers (in order): %s", [n for n, _ in self.providers] or "NONE")
+        self._runners = {"gemini": self._run_gemini, "cohere": self._run_cohere, "claude": self._run_claude}
+        self._model_lists: dict[str, list[str]] = {}
+        self._model_lists_at = 0.0
+
+    def configured(self, provider: str) -> bool:
+        return bool({"gemini": self.gemini_keys, "cohere": self.cohere_clients, "claude": self.claude}.get(provider))
+
+    @staticmethod
+    def default_model(provider: str) -> str:
+        return {"gemini": config.GEMINI_MODEL, "cohere": config.COHERE_MODEL, "claude": config.CLAUDE_MODEL}[provider]
+
+    def chain(self, owner: bool = False, pick: str | None = None) -> list[tuple[str, str]]:
+        """(provider, model) pairs to try in order: the user's pick first (if
+        any), then Claude for the owner, then the default providers."""
+        chain = []
+        if pick:
+            provider, _, model = pick.partition(":")
+            if self.configured(provider) and (provider != "claude" or owner):
+                chain.append((provider, model))
+        if owner and self.claude:
+            chain.append(("claude", config.CLAUDE_MODEL))
+        chain += [(name, self.default_model(name)) for name, _ in self.providers]
+        return list(dict.fromkeys(chain))  # dedupe, keep order
+
+    async def list_models(self) -> dict[str, list[str]]:
+        """Chat models each configured provider offers, cached for an hour.
+        Includes Claude when configured — callers must only show it to the owner."""
+        if self._model_lists and time.monotonic() - self._model_lists_at < MODEL_LIST_TTL:
+            return self._model_lists
+        lists: dict[str, list[str]] = {}
+        fetchers = {"gemini": self._list_gemini, "cohere": self._list_cohere, "claude": self._list_claude}
+        for provider, fetch in fetchers.items():
+            if not self.configured(provider):
+                continue
+            try:
+                lists[provider] = await fetch()
+            except Exception as e:  # noqa: BLE001 — a provider being down shouldn't hide the others
+                log.warning("Couldn't list %s models: %s", provider, e)
+                lists[provider] = [m for m in [self.default_model(provider)] if m]
+        self._model_lists, self._model_lists_at = lists, time.monotonic()
+        return lists
+
+    async def _list_gemini(self) -> list[str]:
+        headers = {"x-goog-api-key": self.gemini_keys.items[0]}
+        async with self.http.get(GEMINI_MODELS_URL, headers=headers) as resp:
+            data = await resp.json()
+            if resp.status != 200:
+                raise RuntimeError(data.get("error", {}).get("message", f"HTTP {resp.status}"))
+        names = [m["name"].removeprefix("models/") for m in data.get("models", [])]
+        names = [n for n in names if GEMINI_CHAT_RE.match(n)]
+        if not config.GEMINI_LIST_PRO:
+            names = [n for n in names if "-pro" not in n]
+        return sorted(names, reverse=True)
+
+    async def _list_cohere(self) -> list[str]:
+        res = await self.cohere_clients.items[0].models.list(endpoint="chat", page_size=100)
+        return sorted((m.name for m in res.models or [] if m.name), reverse=True)
+
+    async def _list_claude(self) -> list[str]:
+        url = config.CLAUDE_API_URL.rstrip("/") + "/v1/models"
+        headers = {"x-api-key": config.CLAUDE_API_KEY} if config.CLAUDE_API_KEY else {}
+        async with self.http.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            data = await resp.json()
+        return [m["id"] for m in data.get("data", [])]
 
     async def run(
-        self, system: str, prompt: str, tools: list[Tool], images: list[Image] = (), owner: bool = False
-    ) -> str | None:
-        """Run the agent loop; None if every provider failed."""
+        self,
+        system: str,
+        prompt: str,
+        tools: list[Tool],
+        images: list[Image] = (),
+        owner: bool = False,
+        pick: str | None = None,
+    ) -> tuple[str, str] | None:
+        """Run the agent loop; returns (answer, "provider:model") or None if
+        every provider failed. `pick` is the user's chosen "provider:model"."""
         by_name = {t.name: t for t in tools}
-        providers = self.providers
-        if owner and self.claude:
-            providers = [("claude", self.claude)] + providers
-        for name, provider in providers:
+        for provider, model in self.chain(owner, pick):
+            label = f"{provider}:{model}" if model else provider
             try:
-                answer = await provider(system, prompt, by_name, list(images))
-                log.info("Answered by %s", name)
-                return answer
+                answer = await self._runners[provider](system, prompt, by_name, list(images), model)
+                log.info("Answered by %s", label)
+                return answer, label
             except Exception as e:  # noqa: BLE001 — fall through to the next provider
-                log.error("Provider %s failed: %s", name, e)
+                log.error("%s failed: %s", label, e)
         return None
 
     # --- Gemini ---------------------------------------------------------------
 
-    async def _gemini_request(self, payload: dict) -> dict:
-        url = GEMINI_URL.format(model=config.GEMINI_MODEL)
+    async def _gemini_request(self, payload: dict, model: str) -> dict:
+        url = GEMINI_URL.format(model=model)
         last_error: Exception | None = None
         for key in self.gemini_keys.rotation():
             try:
@@ -150,7 +226,9 @@ class Agent:
                 log.warning("Gemini request failed, rotating key: %s", e)
         raise RuntimeError(f"all Gemini keys failed: {last_error}")
 
-    async def _run_gemini(self, system: str, prompt: str, tools: dict[str, Tool], images: list[Image]) -> str:
+    async def _run_gemini(
+        self, system: str, prompt: str, tools: dict[str, Tool], images: list[Image], model: str
+    ) -> str:
         parts = [
             {"inline_data": {"mime_type": i.mime, "data": i.b64()}}
             for i in images
@@ -171,7 +249,7 @@ class Agent:
                 payload["tools"] = [{"functionDeclarations": declarations}]
                 if round_ == config.CHAT_MAX_TOOL_ROUNDS:  # out of rounds: answer now
                     payload["toolConfig"] = {"functionCallingConfig": {"mode": "NONE"}}
-            content = await self._gemini_request(payload)
+            content = await self._gemini_request(payload, model)
             parts = content.get("parts", [])
             calls = [p["functionCall"] for p in parts if "functionCall" in p]
             if not calls:
@@ -195,17 +273,19 @@ class Agent:
 
     # --- Cohere ---------------------------------------------------------------
 
-    async def _cohere_request(self, **kwargs) -> Any:
+    async def _cohere_request(self, model: str, **kwargs) -> Any:
         last_error: Exception | None = None
         for client in self.cohere_clients.rotation():
             try:
-                return (await client.chat(model=config.COHERE_MODEL, **kwargs)).message
+                return (await client.chat(model=model, **kwargs)).message
             except Exception as e:  # noqa: BLE001 — rotate to the next key on any API failure
                 last_error = e
                 log.warning("Cohere request failed, rotating key: %s", e)
         raise RuntimeError(f"all Cohere keys failed: {last_error}")
 
-    async def _run_cohere(self, system: str, prompt: str, tools: dict[str, Tool], images: list[Image]) -> str:
+    async def _run_cohere(
+        self, system: str, prompt: str, tools: dict[str, Tool], images: list[Image], model: str
+    ) -> str:
         messages: list[dict] = [
             {"role": "system", "content": system},
             {"role": "user", "content": prompt + _image_note(images, None)},
@@ -223,7 +303,7 @@ class Agent:
                 kwargs["tools"] = specs
                 if round_ == config.CHAT_MAX_TOOL_ROUNDS:  # out of rounds: answer now
                     kwargs["tool_choice"] = "NONE"
-            msg = await self._cohere_request(**kwargs)
+            msg = await self._cohere_request(model, **kwargs)
             if not msg.tool_calls:
                 if msg.content:
                     return "".join(c.text for c in msg.content if getattr(c, "type", "text") == "text")
@@ -263,7 +343,9 @@ class Agent:
                 raise RuntimeError(data.get("error", {}).get("message", f"HTTP {resp.status}"))
             return data
 
-    async def _run_claude(self, system: str, prompt: str, tools: dict[str, Tool], images: list[Image]) -> str:
+    async def _run_claude(
+        self, system: str, prompt: str, tools: dict[str, Tool], images: list[Image], model: str
+    ) -> str:
         content: list[dict] = [
             {"type": "image", "source": {"type": "base64", "media_type": i.mime, "data": i.b64()}}
             for i in images
@@ -277,8 +359,8 @@ class Agent:
         ]
         for round_ in range(config.CHAT_MAX_TOOL_ROUNDS + 1):
             body: dict[str, Any] = {"max_tokens": 4096, "system": system, "messages": messages}
-            if config.CLAUDE_MODEL:
-                body["model"] = config.CLAUDE_MODEL
+            if model:
+                body["model"] = model
             if specs:
                 body["tools"] = specs
                 if round_ == config.CHAT_MAX_TOOL_ROUNDS:  # out of rounds: answer now
