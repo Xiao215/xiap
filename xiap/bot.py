@@ -27,7 +27,12 @@ class XiapBot(commands.Bot):
     def __init__(self) -> None:
         intents = discord.Intents.default()
         intents.message_content = True
-        super().__init__(command_prefix="!", intents=intents)
+        # Never let user- or AI-written text ping @everyone/@here or roles.
+        super().__init__(
+            command_prefix="!",
+            intents=intents,
+            allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=True),
+        )
         self._synced = False
         self._all_commands: list = []
 
