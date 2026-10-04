@@ -4,7 +4,9 @@ A friendly AI Discord bot for the Sunday Social group chat. Mention it (or reply
 
 ## Features
 
-**AI chat** — @mention the bot or reply to one of its messages and it responds in character, using the last 30 messages of the channel as context and your server's custom emojis. Powered by Gemini Flash (free tier) and/or Cohere — configure either or both; keys round-robin and providers fail over automatically.
+**AI chat** — @mention the bot or reply to one of its messages and it responds in character with your server's custom emojis. It sees the last few messages up front and pulls more context itself when it needs it — older channel history, a linked message, or a long reply chain — within the limits set by `/context` and `/optout`. Attach an image (or reply to one) and it can see it. Powered by Gemini Flash (free tier) and/or Cohere — configure either or both; keys round-robin and providers fail over automatically.
+
+**Claude for the owner** — if your [claude-api](https://github.com/Xiao215/claude-api) server is running on the machine hosting the bot, the bot owner's messages are answered by Claude on their own subscription, with the same context tools and image support. The owner is whoever owns the bot in the Developer Portal, or `OWNER_ID` if set. Everyone else still gets Gemini/Cohere — a Pro/Max plan is for personal use, so the bot never routes other people's messages to it. If the server is down or rate-limited, you fall back to Gemini/Cohere too.
 
 **Slash commands**
 
@@ -56,9 +58,10 @@ app.py                 entry point
 xiap/
   bot.py               XiapBot, cog loading, slash-command sync
   config.py            env/config
+  llm.py               tool-calling agent loop over Gemini/Cohere
   web.py               aiohttp health-check server
   cogs/
-    chat.py            Cohere AI chat (mentions & replies)
+    chat.py            AI chat (mentions & replies) and its context tools
     fun.py             rps, roll, 8ball, coinflip, choose, ship
     polls.py           button polls
     reminders.py       /remind

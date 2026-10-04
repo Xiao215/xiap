@@ -13,8 +13,8 @@ class HelpCog(commands.Cog):
             color=discord.Color.blurple(),
             description=(
                 "**💬 AI chat** — just @mention me or reply to one of my messages "
-                "and I'll chat back. I remember the last 30 messages of the channel "
-                "and I know this server's custom emojis."
+                "and I'll chat back. I look back through the channel (or a message you link) "
+                "when I need more context, and I know this server's custom emojis."
             ),
         )
         tree = interaction.client.tree
