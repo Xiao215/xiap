@@ -337,12 +337,16 @@ class ChatCog(commands.Cog):
         if message.author.bot or self.bot.user is None or self.agent is None:
             return
 
-        mention = f"<@{self.bot.user.id}>"
         replied = message.reference.resolved if message.reference else None
         if not isinstance(replied, discord.Message):
             replied = None
         is_reply_to_me = replied is not None and replied.author == self.bot.user
-        is_mention = mention in message.content or f"<@!{self.bot.user.id}>" in message.content
+        # Typing "@xiap" autocompletes to either the bot user or the bot's
+        # auto-created managed role of the same name; both count as a ping.
+        my_role = message.guild.self_role if message.guild else None
+        is_mention = self.bot.user.id in message.raw_mentions or (
+            my_role is not None and my_role.id in message.raw_role_mentions
+        )
 
         if not (is_reply_to_me or is_mention):
             return
@@ -359,7 +363,10 @@ class ChatCog(commands.Cog):
 
         # clean_content turns <@id> mentions into readable @names; drop the ping to ourselves.
         me = message.guild.me if message.guild else self.bot.user
-        content = message.clean_content.replace(f"@{me.display_name}", "").strip()
+        content = message.clean_content.replace(f"@{me.display_name}", "")
+        if my_role is not None:
+            content = content.replace(f"@{my_role.name}", "")
+        content = content.strip()
         if not content and not message.attachments:
             await message.channel.send("What do you mean?")
             return
