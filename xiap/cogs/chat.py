@@ -17,7 +17,7 @@ import aiohttp
 import discord
 from discord.ext import commands
 
-from xiap import config
+from xiap import config, discord_md
 from xiap.llm import Agent, Image, Tool
 from xiap.store import store
 
@@ -44,9 +44,14 @@ explanation, and even then aim for under about 1500 characters.
 or "Hi [name]!", and don't restate the question before answering.
 - Use people's names occasionally when it's natural (e.g. to say who you're talking to), \
 not in every message.
-- Discord markdown is available (**bold**, *italics*, `code`, code blocks with language tags, \
-> quotes, bullet lists, ## headers). Keep casual replies plain; use formatting for \
-explanations, lists, or code.
+- Discord markdown is available: **bold**, *italics*, __underline__, ~~strikethrough~~, \
+||spoilers||, `code`, code blocks with language tags, > quotes, - bullet and 1. numbered \
+lists (indent 2 spaces to nest), # / ## / ### headers, and -# small grey subtext. Keep casual \
+replies plain; use formatting for explanations, lists, or code.
+- Discord does NOT render horizontal rules (---), headers smaller than ###, HTML, footnotes, \
+or LaTeX — don't use them. Write math inline with plain symbols (x², √2, ≤, π) or in `code`.
+- Markdown tables don't render natively either. Prefer a list; if a table genuinely helps, \
+keep it small (2–4 short columns) — it gets shown as aligned monospace text.
 - When someone asks about websites, docs, tools, papers, or anything online, include the real \
 URL. Wrap bare URLs in angle brackets so Discord doesn't show a big embed (e.g. \
 <https://example.com>) or use a [masked link](https://example.com). Only give URLs you are \
@@ -263,22 +268,6 @@ class ChatCog(commands.Cog):
                     log.warning("Couldn't download attachment %s: %s", a.filename, e)
         return images
 
-    @staticmethod
-    def _split_message(text: str, limit: int = 2000) -> list[str]:
-        """Split into Discord-sized chunks, preferring paragraph, then line, then word breaks."""
-        chunks: list[str] = []
-        text = text.strip()
-        while len(text) > limit:
-            window = text[:limit]
-            cut = max(window.rfind("\n\n"), window.rfind("\n"))
-            if cut < limit // 2:
-                cut = window.rfind(" ")
-            if cut <= 0:
-                cut = limit
-            chunks.append(text[:cut].rstrip())
-            text = text[cut:].lstrip()
-        return chunks + [text] if text else chunks or ["…"]
-
     # Matches a full emoji token (kept/canonicalized) or bare :name: shorthand (fixed up).
     EMOJI_RE = re.compile(r"<a?:(\w+):\d+>|:(\w+):")
 
@@ -366,34 +355,41 @@ class ChatCog(commands.Cog):
         if message.attachments:
             content += f" [attached: {', '.join(a.filename for a in message.attachments)}]"
 
-        ctx = ChatContext(self.bot, message)
-        # The replied-to message's images count too ("@xiap what's this?" on a photo),
-        # as long as its text would be readable.
-        replied_ok = replied is not None and (
-            replied.author == self.bot.user or (ctx.limit > 0 and ctx.readable(replied, other_bots=True))
-        )
-        async with message.channel.typing():
-            prompt = await self._user_prompt(ctx, replied if replied_ok else None, content)
-            images = await self._images(message, replied if replied_ok else None)
-            pick = store.get_model_pick(message.author.id)
-            result = await self.agent.run(
-                self._system_prompt(message.guild), prompt, ctx.tools(), images, owner=owner, pick=pick
+        try:
+            ctx = ChatContext(self.bot, message)
+            # The replied-to message's images count too ("@xiap what's this?" on a photo),
+            # as long as its text would be readable.
+            replied_ok = replied is not None and (
+                replied.author == self.bot.user or (ctx.limit > 0 and ctx.readable(replied, other_bots=True))
             )
-        if result is None:
-            response = "My brain is fried right now, try again in a bit 😵"
-        else:
-            response, answered_by = result
-            response = self._fix_emojis(response, message.guild)
-            if pick and answered_by != pick:
-                # Let them know their /model choice didn't answer (rate limit, outage…).
-                response += f"\n-# {pick} was unavailable, so {answered_by} answered"
-        chunks = self._split_message(response)
-        # AI output never pings anyone.
-        no_pings = discord.AllowedMentions.none()
-        await message.reply(chunks[0], allowed_mentions=no_pings)
-        for chunk in chunks[1:]:
-            await message.channel.send(chunk, allowed_mentions=no_pings)
-
+            async with message.channel.typing():
+                prompt = await self._user_prompt(ctx, replied if replied_ok else None, content)
+                images = await self._images(message, replied if replied_ok else None)
+                pick = store.get_model_pick(message.author.id)
+                result = await self.agent.run(
+                    self._system_prompt(message.guild), prompt, ctx.tools(), images, owner=owner, pick=pick
+                )
+            if result is None:
+                response = "My brain is fried right now, try again in a bit 😵"
+            else:
+                response, answered_by = result
+                response = discord_md.to_discord(self._fix_emojis(response, message.guild))
+                if pick and answered_by != pick:
+                    # Let them know their /model choice didn't answer (rate limit, outage…).
+                    response += f"\n-# {pick} was unavailable, so {answered_by} answered"
+            chunks = discord_md.split(response)
+            # AI output never pings anyone.
+            no_pings = discord.AllowedMentions.none()
+            await message.reply(chunks[0], allowed_mentions=no_pings)
+            for chunk in chunks[1:]:
+                await message.channel.send(chunk, allowed_mentions=no_pings)
+        except Exception:
+            # Otherwise discord.py just logs it and the ping goes unanswered.
+            log.exception("Chat reply to %s failed", message.author.display_name)
+            try:
+                await message.reply("Something broke on my end, try again 😵", allowed_mentions=discord.AllowedMentions.none())
+            except discord.HTTPException:
+                pass
 
 async def setup(bot: commands.Bot) -> None:
     if not (config.GEMINI_API_KEYS or config.COHERE_API_KEYS):

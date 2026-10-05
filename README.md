@@ -60,6 +60,7 @@ xiap/
   bot.py               XiapBot, cog loading, slash-command sync
   config.py            env/config
   llm.py               tool-calling agent loop over Gemini/Cohere
+  discord_md.py        fixes model markdown for Discord (tables, rules), fence-safe splitting
   web.py               aiohttp health-check server
   cogs/
     chat.py            AI chat (mentions & replies) and its context tools

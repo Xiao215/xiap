@@ -9,10 +9,12 @@ switched off so it has to answer with what it has).
 Gemini and Cohere round-robin across their configured API keys. Claude goes
 through the owner's local claude-api server (Anthropic Messages format) and is
 only ever used for the owner's own messages — a Pro/Max plan is for personal
-use. If a provider fails outright the whole run restarts on the next. Tools are
-read-only, so re-running them on failover is harmless.
+use. If a provider fails outright, or takes longer than its deadline, the whole
+run restarts on the next. Tools are read-only, so re-running them on failover
+is harmless.
 """
 
+import asyncio
 import base64
 import json
 import logging
@@ -37,6 +39,11 @@ MODEL_LIST_TTL = 3600  # seconds to cache the model lists
 
 # Tool results are truncated to this many characters so one call can't blow up the prompt.
 MAX_TOOL_RESULT_CHARS = 6000
+
+
+def _describe(e: BaseException) -> str:
+    """Error text for logs; timeouts and some network errors have an empty str()."""
+    return str(e) or type(e).__name__
 
 
 @dataclass
@@ -103,7 +110,7 @@ class Agent:
         self.http = http
         self.gemini_keys = KeyRing(config.GEMINI_API_KEYS) if config.GEMINI_API_KEYS else None
         self.cohere_clients = (
-            KeyRing([cohere.AsyncClientV2(api_key=k) for k in config.COHERE_API_KEYS])
+            KeyRing([cohere.AsyncClientV2(api_key=k, timeout=60) for k in config.COHERE_API_KEYS])
             if config.COHERE_API_KEYS
             else None
         )
@@ -201,12 +208,17 @@ class Agent:
         by_name = {t.name: t for t in tools}
         for provider, model in self.chain(owner, pick):
             label = f"{provider}:{model}" if model else provider
+            # A slow model (thinking, preview, a stuck connection) shouldn't
+            # leave the chat staring at "typing…" — give up and fail over.
+            deadline = config.CLAUDE_TIMEOUT if provider == "claude" else config.CHAT_TIMEOUT
+            started = time.monotonic()
             try:
-                answer = await self._runners[provider](system, prompt, by_name, list(images), model)
-                log.info("Answered by %s", label)
+                async with asyncio.timeout(deadline):
+                    answer = await self._runners[provider](system, prompt, by_name, list(images), model)
+                log.info("Answered by %s in %.1fs", label, time.monotonic() - started)
                 return answer, label
             except Exception as e:  # noqa: BLE001 — fall through to the next provider
-                log.error("%s failed: %s", label, e)
+                log.error("%s failed after %.1fs: %s", label, time.monotonic() - started, _describe(e))
         return None
 
     # --- Gemini ---------------------------------------------------------------
@@ -223,7 +235,7 @@ class Agent:
                     return data["candidates"][0]["content"]
             except Exception as e:  # noqa: BLE001 — rotate to the next key on any API failure
                 last_error = e
-                log.warning("Gemini request failed, rotating key: %s", e)
+                log.warning("Gemini request failed, rotating key: %s", _describe(e))
         raise RuntimeError(f"all Gemini keys failed: {last_error}")
 
     async def _run_gemini(
@@ -280,7 +292,7 @@ class Agent:
                 return (await client.chat(model=model, **kwargs)).message
             except Exception as e:  # noqa: BLE001 — rotate to the next key on any API failure
                 last_error = e
-                log.warning("Cohere request failed, rotating key: %s", e)
+                log.warning("Cohere request failed, rotating key: %s", _describe(e))
         raise RuntimeError(f"all Cohere keys failed: {last_error}")
 
     async def _run_cohere(
@@ -305,9 +317,11 @@ class Agent:
                     kwargs["tool_choice"] = "NONE"
             msg = await self._cohere_request(model, **kwargs)
             if not msg.tool_calls:
-                if msg.content:
-                    return "".join(c.text for c in msg.content if getattr(c, "type", "text") == "text")
-                raise RuntimeError("empty response")
+                # Reasoning models also return "thinking" items; only text is the answer.
+                text = "".join(c.text for c in msg.content or [] if getattr(c, "type", "text") == "text")
+                if not text.strip():
+                    raise RuntimeError("empty response")
+                return text
 
             messages.append({
                 "role": "assistant",

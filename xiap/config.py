@@ -50,6 +50,10 @@ CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY", "")  # only if claude-api has API_K
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "")  # haiku | sonnet | opus; empty = server default
 CLAUDE_TIMEOUT = int(os.getenv("CLAUDE_TIMEOUT", "300"))  # per request; the CLI can be slow
 
+# Seconds a Gemini/Cohere model gets to answer (all tool rounds included)
+# before the bot gives up on it and fails over to the next one.
+CHAT_TIMEOUT = int(os.getenv("CHAT_TIMEOUT", "90"))
+
 # Images attached to the pinging message (or the one it replies to) are shown
 # to the model, up to this many, each at most CHAT_IMAGE_MAX_MB.
 CHAT_MAX_IMAGES = int(os.getenv("CHAT_MAX_IMAGES", "4"))
