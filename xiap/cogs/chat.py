@@ -284,6 +284,23 @@ class ChatCog(commands.Cog):
 
         return cls.EMOJI_RE.sub(repl, text)
 
+    @staticmethod
+    def _model_tag(answered_by: str, pick: str | None) -> discord.ui.View:
+        """A gray, unclickable button under the reply naming the model that wrote it."""
+        def name(label: str) -> str:
+            provider, _, model = label.partition(":")
+            return model or provider
+
+        label = name(answered_by)
+        if pick and answered_by != pick:
+            # Let them know their /model choice didn't answer (rate limit, outage…).
+            label += f" (fallback, {name(pick)} unavailable)"
+        view = discord.ui.View()
+        view.add_item(discord.ui.Button(label=label[:80], style=discord.ButtonStyle.secondary, disabled=True))
+        # Stopped views aren't kept in discord.py's view store; nothing listens to this button.
+        view.stop()
+        return view
+
     def _system_prompt(self, guild: discord.Guild | None) -> str:
         # str(emoji) yields the exact sendable token: <:name:id> or <a:name:id> for animated.
         emojis = "\n".join(str(e) for e in (guild.emojis if guild else ()))
@@ -377,19 +394,18 @@ class ChatCog(commands.Cog):
                     self._system_prompt(message.guild), prompt, ctx.tools(), images, owner=owner, pick=pick
                 )
             if result is None:
-                response = "My brain is fried right now, try again in a bit 😵"
+                response, tag = "My brain is fried right now, try again in a bit 😵", None
             else:
                 response, answered_by = result
                 response = discord_md.to_discord(self._fix_emojis(response, message.guild))
-                if pick and answered_by != pick:
-                    # Let them know their /model choice didn't answer (rate limit, outage…).
-                    response += f"\n-# {pick} was unavailable, so {answered_by} answered"
+                tag = self._model_tag(answered_by, pick)
             chunks = discord_md.split(response)
             # AI output never pings anyone.
             no_pings = discord.AllowedMentions.none()
-            await message.reply(chunks[0], allowed_mentions=no_pings)
-            for chunk in chunks[1:]:
-                await message.channel.send(chunk, allowed_mentions=no_pings)
+            for i, chunk in enumerate(chunks):
+                send = message.reply if i == 0 else message.channel.send
+                # The model tag goes under the last chunk, at the end of the reply.
+                await send(chunk, allowed_mentions=no_pings, view=tag if i == len(chunks) - 1 else None)
         except Exception:
             # Otherwise discord.py just logs it and the ping goes unanswered.
             log.exception("Chat reply to %s failed", message.author.display_name)
