@@ -285,13 +285,13 @@ class ChatCog(commands.Cog):
         return cls.EMOJI_RE.sub(repl, text)
 
     @staticmethod
-    def _model_tag(answered_by: str, pick: str | None) -> discord.ui.View:
+    def _model_tag(answered_by: str, used: str, pick: str | None) -> discord.ui.View:
         """A gray, unclickable button under the reply naming the model that wrote it."""
         def name(label: str) -> str:
             provider, _, model = label.partition(":")
             return model or provider
 
-        label = name(answered_by)
+        label = used or name(answered_by)
         if pick and answered_by != pick:
             # Let them know their /model choice didn't answer (rate limit, outage…).
             label += f" (fallback, {name(pick)} unavailable)"
@@ -396,9 +396,9 @@ class ChatCog(commands.Cog):
             if result is None:
                 response, tag = "My brain is fried right now, try again in a bit 😵", None
             else:
-                response, answered_by = result
+                response, answered_by, used = result
                 response = discord_md.to_discord(self._fix_emojis(response, message.guild))
-                tag = self._model_tag(answered_by, pick)
+                tag = self._model_tag(answered_by, used, pick)
             chunks = discord_md.split(response)
             # AI output never pings anyone.
             no_pings = discord.AllowedMentions.none()

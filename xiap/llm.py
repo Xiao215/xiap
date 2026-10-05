@@ -202,9 +202,10 @@ class Agent:
         images: list[Image] = (),
         owner: bool = False,
         pick: str | None = None,
-    ) -> tuple[str, str] | None:
-        """Run the agent loop; returns (answer, "provider:model") or None if
-        every provider failed. `pick` is the user's chosen "provider:model"."""
+    ) -> tuple[str, str, str] | None:
+        """Run the agent loop; returns (answer, "provider:model" from the chain,
+        the model id that actually answered) or None if every provider failed.
+        `pick` is the user's chosen "provider:model"."""
         by_name = {t.name: t for t in tools}
         for provider, model in self.chain(owner, pick):
             label = f"{provider}:{model}" if model else provider
@@ -214,9 +215,9 @@ class Agent:
             started = time.monotonic()
             try:
                 async with asyncio.timeout(deadline):
-                    answer = await self._runners[provider](system, prompt, by_name, list(images), model)
-                log.info("Answered by %s in %.1fs", label, time.monotonic() - started)
-                return answer, label
+                    answer, used = await self._runners[provider](system, prompt, by_name, list(images), model)
+                log.info("Answered by %s (%s) in %.1fs", label, used, time.monotonic() - started)
+                return answer, label, used
             except Exception as e:  # noqa: BLE001 — fall through to the next provider
                 log.error("%s failed after %.1fs: %s", label, time.monotonic() - started, _describe(e))
         return None
@@ -240,7 +241,7 @@ class Agent:
 
     async def _run_gemini(
         self, system: str, prompt: str, tools: dict[str, Tool], images: list[Image], model: str
-    ) -> str:
+    ) -> tuple[str, str]:
         parts = [
             {"inline_data": {"mime_type": i.mime, "data": i.b64()}}
             for i in images
@@ -268,7 +269,7 @@ class Agent:
                 text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
                 if not text.strip():
                     raise RuntimeError("empty response")
-                return text
+                return text, model
 
             # Echo the model turn back verbatim: it carries thought signatures
             # that Gemini requires to continue a function-calling conversation.
@@ -297,7 +298,7 @@ class Agent:
 
     async def _run_cohere(
         self, system: str, prompt: str, tools: dict[str, Tool], images: list[Image], model: str
-    ) -> str:
+    ) -> tuple[str, str]:
         messages: list[dict] = [
             {"role": "system", "content": system},
             {"role": "user", "content": prompt + _image_note(images, None)},
@@ -321,7 +322,7 @@ class Agent:
                 text = "".join(c.text for c in msg.content or [] if getattr(c, "type", "text") == "text")
                 if not text.strip():
                     raise RuntimeError("empty response")
-                return text
+                return text, model
 
             messages.append({
                 "role": "assistant",
@@ -359,7 +360,7 @@ class Agent:
 
     async def _run_claude(
         self, system: str, prompt: str, tools: dict[str, Tool], images: list[Image], model: str
-    ) -> str:
+    ) -> tuple[str, str]:
         content: list[dict] = [
             {"type": "image", "source": {"type": "base64", "media_type": i.mime, "data": i.b64()}}
             for i in images
@@ -379,13 +380,16 @@ class Agent:
                 body["tools"] = specs
                 if round_ == config.CHAT_MAX_TOOL_ROUNDS:  # out of rounds: answer now
                     body["tool_choice"] = {"type": "none"}
-            blocks = (await self._claude_request(body))["content"]
+            data = await self._claude_request(body)
+            blocks = data["content"]
             calls = [b for b in blocks if b["type"] == "tool_use"]
             if not calls:
                 text = "".join(b.get("text", "") for b in blocks if b["type"] == "text")
                 if not text.strip():
                     raise RuntimeError("empty response")
-                return text
+                # The server reports the full id ("claude-opus-5-5") even when
+                # we asked for an alias like "opus" or the server default.
+                return text, data.get("model") or model
 
             messages.append({"role": "assistant", "content": blocks})
             results = []
