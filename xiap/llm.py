@@ -1,15 +1,15 @@
 """Tool-calling agent loop over Gemini, Cohere and (owner only) Claude.
 
-The model gets a system prompt, the user's message (plus any images) and a set
-of tools. Each
-round it either answers or asks for tools; we run them, hand back the results
+The model gets a system prompt, the user's message (plus any images and PDFs)
+and a set of tools. Each round it either answers or asks for tools; we run them, hand back the results
 and repeat until it answers (or runs out of rounds, at which point tools are
 switched off so it has to answer with what it has).
 
 Gemini and Cohere round-robin across their configured API keys. Claude goes
 through the owner's local claude-api server (Anthropic Messages format) and is
 only ever used for the owner's own messages — a Pro/Max plan is for personal
-use. If a provider fails outright, or takes longer than its deadline, the whole
+use. Cohere can't read PDFs, so when one is attached the providers that can
+go first. If a provider fails outright, or takes longer than its deadline, the whole
 run restarts on the next. Tools are read-only, so re-running them on failover
 is harmless.
 """
@@ -46,25 +46,44 @@ def _describe(e: BaseException) -> str:
     return str(e) or type(e).__name__
 
 
+PDF = "application/pdf"
+
+
 @dataclass
-class Image:
-    mime: str  # e.g. "image/png"
+class Attachment:
+    """An image or PDF shown to the model as-is."""
+
+    mime: str  # e.g. "image/png" or "application/pdf"
     data: bytes
+    filename: str = ""
 
     def b64(self) -> str:
         return base64.b64encode(self.data).decode()
 
 
-GEMINI_IMAGE_TYPES = {"image/png", "image/jpeg", "image/webp", "image/heic", "image/heif"}
-CLAUDE_IMAGE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
+GEMINI_TYPES = {"image/png", "image/jpeg", "image/webp", "image/heic", "image/heif", PDF}
+CLAUDE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp", PDF}
+# Providers that read PDFs (every Gemini chat model does, and Claude does).
+PDF_PROVIDERS = {"gemini", "claude"}
 
 
-def _image_note(images: list[Image], supported: set[str] | None) -> str:
-    """Tell the model about attached images it won't be able to see."""
-    skipped = len(images) if supported is None else sum(i.mime not in supported for i in images)
+def reads_pdfs(label: str) -> bool:
+    """Whether a "provider:model" label (or bare provider) can read PDFs."""
+    return label.partition(":")[0] in PDF_PROVIDERS
+
+
+def _attachment_note(attachments: list[Attachment], supported: set[str]) -> str:
+    """Tell the model about attached files it won't be able to see."""
+    skipped = [a for a in attachments if a.mime not in supported]
+    pdfs = sum(a.mime == PDF for a in skipped)
+    images = len(skipped) - pdfs
     if not skipped:
         return ""
-    return f"\n\n({skipped} attached image(s) couldn't be shown to you — don't pretend to see them.)"
+    what = " and ".join(f"{n} {kind}" for n, kind in ((images, "image(s)"), (pdfs, "PDF(s)")) if n)
+    return (
+        f"\n\n({what} attached couldn't be shown to you — don't pretend to see them. If they matter "
+        "to the question, say you can't read them.)"
+    )
 
 
 @dataclass
@@ -140,9 +159,11 @@ class Agent:
     def default_model(provider: str) -> str:
         return {"gemini": config.GEMINI_MODEL, "cohere": config.COHERE_MODEL, "claude": config.CLAUDE_MODEL}[provider]
 
-    def chain(self, owner: bool = False, pick: str | None = None) -> list[tuple[str, str]]:
+    def chain(self, owner: bool = False, pick: str | None = None, pdf: bool = False) -> list[tuple[str, str]]:
         """(provider, model) pairs to try in order: the user's pick first (if
-        any), then Claude for the owner, then the default providers."""
+        any), then Claude for the owner, then the default providers. With a PDF
+        attached, the ones that can read it move to the front; the rest stay as
+        a last resort."""
         chain = []
         if pick:
             provider, _, model = pick.partition(":")
@@ -151,7 +172,10 @@ class Agent:
         if owner and self.claude:
             chain.append(("claude", config.CLAUDE_MODEL))
         chain += [(name, self.default_model(name)) for name, _ in self.providers]
-        return list(dict.fromkeys(chain))  # dedupe, keep order
+        chain = list(dict.fromkeys(chain))  # dedupe, keep order
+        if pdf:  # stable sort: PDF readers first, order otherwise kept
+            chain.sort(key=lambda pm: pm[0] not in PDF_PROVIDERS)
+        return chain
 
     async def list_models(self) -> dict[str, list[str]]:
         """Chat models each configured provider offers, cached for an hour.
@@ -199,7 +223,7 @@ class Agent:
         system: str,
         prompt: str,
         tools: list[Tool],
-        images: list[Image] = (),
+        attachments: list[Attachment] = (),
         owner: bool = False,
         pick: str | None = None,
     ) -> tuple[str, str, str] | None:
@@ -207,7 +231,8 @@ class Agent:
         the model id that actually answered) or None if every provider failed.
         `pick` is the user's chosen "provider:model"."""
         by_name = {t.name: t for t in tools}
-        for provider, model in self.chain(owner, pick):
+        pdf = any(a.mime == PDF for a in attachments)
+        for provider, model in self.chain(owner, pick, pdf):
             label = f"{provider}:{model}" if model else provider
             # A slow model (thinking, preview, a stuck connection) shouldn't
             # leave the chat staring at "typing…" — give up and fail over.
@@ -215,7 +240,7 @@ class Agent:
             started = time.monotonic()
             try:
                 async with asyncio.timeout(deadline):
-                    answer, used = await self._runners[provider](system, prompt, by_name, list(images), model)
+                    answer, used = await self._runners[provider](system, prompt, by_name, list(attachments), model)
                 log.info("Answered by %s (%s) in %.1fs", label, used, time.monotonic() - started)
                 return answer, label, used
             except Exception as e:  # noqa: BLE001 — fall through to the next provider
@@ -240,14 +265,14 @@ class Agent:
         raise RuntimeError(f"all Gemini keys failed: {last_error}")
 
     async def _run_gemini(
-        self, system: str, prompt: str, tools: dict[str, Tool], images: list[Image], model: str
+        self, system: str, prompt: str, tools: dict[str, Tool], attachments: list[Attachment], model: str
     ) -> tuple[str, str]:
         parts = [
-            {"inline_data": {"mime_type": i.mime, "data": i.b64()}}
-            for i in images
-            if i.mime in GEMINI_IMAGE_TYPES
+            {"inline_data": {"mime_type": a.mime, "data": a.b64()}}
+            for a in attachments
+            if a.mime in GEMINI_TYPES
         ]
-        parts.append({"text": prompt + _image_note(images, GEMINI_IMAGE_TYPES)})
+        parts.append({"text": prompt + _attachment_note(attachments, GEMINI_TYPES)})
         contents: list[dict] = [{"role": "user", "parts": parts}]
         declarations = [
             {"name": t.name, "description": t.description, "parameters": t.parameters}
@@ -297,11 +322,11 @@ class Agent:
         raise RuntimeError(f"all Cohere keys failed: {last_error}")
 
     async def _run_cohere(
-        self, system: str, prompt: str, tools: dict[str, Tool], images: list[Image], model: str
+        self, system: str, prompt: str, tools: dict[str, Tool], attachments: list[Attachment], model: str
     ) -> tuple[str, str]:
         messages: list[dict] = [
             {"role": "system", "content": system},
-            {"role": "user", "content": prompt + _image_note(images, None)},
+            {"role": "user", "content": prompt + _attachment_note(attachments, set())},
         ]
         specs = [
             {
@@ -359,14 +384,18 @@ class Agent:
             return data
 
     async def _run_claude(
-        self, system: str, prompt: str, tools: dict[str, Tool], images: list[Image], model: str
+        self, system: str, prompt: str, tools: dict[str, Tool], attachments: list[Attachment], model: str
     ) -> tuple[str, str]:
         content: list[dict] = [
-            {"type": "image", "source": {"type": "base64", "media_type": i.mime, "data": i.b64()}}
-            for i in images
-            if i.mime in CLAUDE_IMAGE_TYPES
+            {
+                "type": "document" if a.mime == PDF else "image",
+                "source": {"type": "base64", "media_type": a.mime, "data": a.b64()},
+                **({"title": a.filename} if a.mime == PDF and a.filename else {}),
+            }
+            for a in attachments
+            if a.mime in CLAUDE_TYPES
         ]
-        content.append({"type": "text", "text": prompt + _image_note(images, CLAUDE_IMAGE_TYPES)})
+        content.append({"type": "text", "text": prompt + _attachment_note(attachments, CLAUDE_TYPES)})
         messages: list[dict] = [{"role": "user", "content": content}]
         specs = [
             {"name": t.name, "description": t.description, "input_schema": t.parameters}

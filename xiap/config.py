@@ -58,6 +58,16 @@ CHAT_TIMEOUT = int(os.getenv("CHAT_TIMEOUT", "90"))
 # to the model, up to this many, each at most CHAT_IMAGE_MAX_MB.
 CHAT_MAX_IMAGES = int(os.getenv("CHAT_MAX_IMAGES", "4"))
 CHAT_IMAGE_MAX_MB = float(os.getenv("CHAT_IMAGE_MAX_MB", "5"))
+# PDFs go to a model that can read them (Gemini or Claude; Cohere can't, so
+# it's skipped while one can answer). Up to CHAT_MAX_PDFS, each at most
+# CHAT_PDF_MAX_MB. All images and PDFs in one ping together stay under ~14 MB,
+# since Gemini and the claude-api server cap a request at 20 MB once base64'd.
+CHAT_MAX_PDFS = int(os.getenv("CHAT_MAX_PDFS", "2"))
+CHAT_PDF_MAX_MB = float(os.getenv("CHAT_PDF_MAX_MB", "10"))
+# Text files (.txt, .md, .csv, code…) are pasted into the prompt for every
+# model: up to CHAT_MAX_TEXT_FILES, each cut off after CHAT_TEXT_MAX_CHARS.
+CHAT_MAX_TEXT_FILES = int(os.getenv("CHAT_MAX_TEXT_FILES", "3"))
+CHAT_TEXT_MAX_CHARS = int(os.getenv("CHAT_TEXT_MAX_CHARS", "20000"))
 
 # Default cap on how far back the AI may read channel history (per-channel
 # override via /context). It only sees CHAT_BASE_CONTEXT messages up front and

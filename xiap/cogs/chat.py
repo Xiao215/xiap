@@ -3,13 +3,15 @@
 Instead of dumping the whole channel history into every request, the model
 gets a small window of recent messages and tools to pull more when it needs
 it: older channel history, or a specific message (by id or link) along with
-the reply chain above it. Images on the pinging message (or the one it
-replies to) are shown to the model too. Everything it can read still obeys
-/context and /optout. Provider handling (Gemini/Cohere for everyone, Claude
-for the owner only, key rotation, failover) lives in xiap.llm.
+the reply chain above it. Files on the pinging message (or the one it replies
+to) are shown to the model too: images and PDFs as-is, text files pasted into
+the prompt. Everything it can read still obeys /context and /optout. Provider
+handling (Gemini/Cohere for everyone, Claude for the owner only, key rotation,
+failover, PDF-capable models first) lives in xiap.llm.
 """
 
 import logging
+import os
 import re
 from zoneinfo import ZoneInfo
 
@@ -18,7 +20,7 @@ import discord
 from discord.ext import commands
 
 from xiap import config, discord_md
-from xiap.llm import Agent, Image, Tool
+from xiap.llm import PDF, Agent, Attachment, Tool, reads_pdfs
 from xiap.store import store
 
 log = logging.getLogger(__name__)
@@ -26,6 +28,24 @@ log = logging.getLogger(__name__)
 TZ = ZoneInfo(config.TIMEZONE)
 MESSAGE_LINK_RE = re.compile(r"discord(?:app)?\.com/channels/(\d+|@me)/(\d+)/(\d+)")
 MAX_REPLY_CHAIN = 5
+
+MB = 1024 * 1024
+# Images and PDFs in one ping together stay under this, so the request stays
+# under Gemini's and the claude-api server's 20 MB limit once base64'd.
+MAX_INLINE_BYTES = 14 * MB
+# Text files bigger than this aren't downloaded just to be cut off.
+MAX_TEXT_BYTES = 1 * MB
+# Read as text even when Discord doesn't label them text/*.
+TEXT_MIMES = {
+    "application/json", "application/xml", "application/yaml", "application/x-yaml",
+    "application/toml", "application/javascript", "application/x-sh", "application/sql",
+}
+TEXT_EXTENSIONS = {
+    ".txt", ".md", ".rst", ".csv", ".tsv", ".log", ".json", ".jsonl", ".yaml", ".yml", ".toml",
+    ".ini", ".cfg", ".xml", ".html", ".css", ".tex", ".bib", ".sql", ".sh", ".py", ".ipynb",
+    ".js", ".jsx", ".ts", ".tsx", ".java", ".kt", ".c", ".h", ".cpp", ".hpp", ".cs", ".go",
+    ".rs", ".rb", ".php", ".swift", ".r", ".m", ".lua", ".hs", ".ml", ".scala", ".dart",
+}
 
 SYSTEM_PROMPT = """\
 You are {name}, a member of the Sunday Social Discord group chat. You hang out and talk \
@@ -79,6 +99,9 @@ guessing.
 one message by id or link plus the messages it replies to.
 - If a tool says something is off-limits (history turned off, someone opted out), respect that \
 and don't speculate about the hidden content.
+- Files attached to the message that pinged you (or the one it replies to) are shown to you: \
+images and PDFs directly, text files pasted in. Files on other messages only show up as names \
+in `[attached: …]`, and you can't open them.
 
 ### Your features
 - Besides chatting, you have slash commands. When someone asks what you can do or how to use \
@@ -252,21 +275,68 @@ class ChatCog(commands.Cog):
         return await self.bot.is_owner(user)
 
     @staticmethod
-    async def _images(*messages: discord.Message | None) -> list[Image]:
-        """Image attachments from the given messages, within the count/size limits."""
-        images: list[Image] = []
+    def _kind(a: discord.Attachment) -> tuple[str, str]:
+        """("image" | "pdf" | "text" | "other", mime type) for an attachment."""
+        mime = (a.content_type or "").split(";")[0].strip().lower()
+        ext = os.path.splitext(a.filename)[1].lower()
+        if mime == PDF or ext == ".pdf":
+            return "pdf", PDF
+        if mime.startswith("image/"):
+            return "image", mime
+        if mime.startswith("text/") or mime in TEXT_MIMES:
+            return "text", mime
+        # .ts is also a video format; trust Discord when it says so.
+        if ext in TEXT_EXTENSIONS and not mime.startswith(("video/", "audio/")):
+            return "text", mime
+        return "other", mime
+
+    @classmethod
+    async def _attachments(cls, *messages: discord.Message | None) -> tuple[list[Attachment], list[str], list[str]]:
+        """Files on the given messages, within the count/size limits: images and
+        PDFs to show the model, text files as prompt sections, and the names of
+        the files it won't get."""
+        limits = {
+            "image": (config.CHAT_MAX_IMAGES, config.CHAT_IMAGE_MAX_MB * MB),
+            "pdf": (config.CHAT_MAX_PDFS, config.CHAT_PDF_MAX_MB * MB),
+            "text": (config.CHAT_MAX_TEXT_FILES, MAX_TEXT_BYTES),
+        }
+        counts = dict.fromkeys(limits, 0)
+        media: list[Attachment] = []
+        texts: list[str] = []
+        skipped: list[str] = []
+        inline = 0
         for msg in messages:
             for a in msg.attachments if msg else ():
-                mime = (a.content_type or "").split(";")[0]
-                if not mime.startswith("image/") or a.size > config.CHAT_IMAGE_MAX_MB * 1024 * 1024:
+                kind, mime = cls._kind(a)
+                max_count, max_bytes = limits.get(kind, (0, 0))
+                if counts.get(kind, 0) >= max_count or a.size > max_bytes or (
+                    kind != "text" and inline + a.size > MAX_INLINE_BYTES
+                ):
+                    skipped.append(a.filename)
                     continue
-                if len(images) >= config.CHAT_MAX_IMAGES:
-                    return images
                 try:
-                    images.append(Image(mime, await a.read()))
+                    data = await a.read()
                 except discord.HTTPException as e:
                     log.warning("Couldn't download attachment %s: %s", a.filename, e)
-        return images
+                    skipped.append(a.filename)
+                    continue
+                if kind == "text":
+                    if b"\x00" in data[:8192]:  # binary after all
+                        skipped.append(a.filename)
+                        continue
+                    texts.append(cls._text_section(a.filename, msg.author.display_name, data.decode("utf-8", "replace")))
+                else:
+                    media.append(Attachment(mime, data, a.filename))
+                    inline += len(data)
+                counts[kind] += 1
+        return media, texts, skipped
+
+    @staticmethod
+    def _text_section(filename: str, author: str, text: str) -> str:
+        limit = config.CHAT_TEXT_MAX_CHARS
+        if len(text) > limit:
+            text = text[:limit] + f"\n…(cut off: only the first {limit:,} of {len(text):,} characters are shown)"
+        return f"=== {filename} (attached by {author}) ===\n{text}\n=== end of {filename} ==="
 
     # Matches a full emoji token (kept/canonicalized) or bare :name: shorthand (fixed up).
     EMOJI_RE = re.compile(r"<a?:(\w+):\d+>|:(\w+):")
@@ -285,16 +355,22 @@ class ChatCog(commands.Cog):
         return cls.EMOJI_RE.sub(repl, text)
 
     @staticmethod
-    def _model_tag(answered_by: str, used: str, pick: str | None) -> discord.ui.View:
+    def _model_tag(answered_by: str, used: str, pick: str | None, pdf: bool = False) -> discord.ui.View:
         """A gray, unclickable button under the reply naming the model that wrote it."""
         def name(label: str) -> str:
             provider, _, model = label.partition(":")
             return model or provider
 
         label = used or name(answered_by)
-        if pick and answered_by != pick:
-            # Let them know their /model choice didn't answer (rate limit, outage…).
-            label += f" (fallback, {name(pick)} unavailable)"
+        if pdf and not reads_pdfs(answered_by):
+            # Every model that reads PDFs was down; this one only saw the text.
+            label += " (can't read PDFs)"
+        elif pick and answered_by != pick:
+            # Let them know their /model choice didn't answer and why.
+            if pdf and not reads_pdfs(pick):
+                label += f" (switched, {name(pick)} can't read PDFs)"
+            else:
+                label += f" (fallback, {name(pick)} unavailable)"
         view = discord.ui.View()
         view.add_item(discord.ui.Button(label=label[:80], style=discord.ButtonStyle.secondary, disabled=True))
         # Stopped views aren't kept in discord.py's view store; nothing listens to this button.
@@ -316,7 +392,10 @@ class ChatCog(commands.Cog):
             features=features,
         )
 
-    async def _user_prompt(self, ctx: ChatContext, replied: discord.Message | None, content: str) -> str:
+    async def _user_prompt(
+        self, ctx: ChatContext, replied: discord.Message | None, content: str,
+        texts: list[str] = (), skipped: list[str] = (),
+    ) -> str:
         sections: list[str] = []
         if ctx.limit <= 0:
             sections.append(
@@ -335,6 +414,13 @@ class ChatCog(commands.Cog):
         author = ctx.message.author.display_name
         if replied is not None:
             sections.append(f"{author} is replying to this message:\n{ctx.format(replied)}")
+        if texts:
+            sections.append("Attached text files:\n\n" + "\n\n".join(texts))
+        if skipped:
+            sections.append(
+                f"(You can't see these attached files — too big, too many, or a type you can't "
+                f"read: {', '.join(skipped)}. Don't pretend to know what's in them.)"
+            )
         sections.append(f"{author} says to you: {content}")
         return "\n\n".join(sections)
 
@@ -381,24 +467,24 @@ class ChatCog(commands.Cog):
 
         try:
             ctx = ChatContext(self.bot, message)
-            # The replied-to message's images count too ("@xiap what's this?" on a photo),
-            # as long as its text would be readable.
+            # The replied-to message's files count too ("@xiap what's this?" on a photo
+            # or a PDF), as long as its text would be readable.
             replied_ok = replied is not None and (
                 replied.author == self.bot.user or (ctx.limit > 0 and ctx.readable(replied, other_bots=True))
             )
             async with message.channel.typing():
-                prompt = await self._user_prompt(ctx, replied if replied_ok else None, content)
-                images = await self._images(message, replied if replied_ok else None)
+                media, texts, skipped = await self._attachments(message, replied if replied_ok else None)
+                prompt = await self._user_prompt(ctx, replied if replied_ok else None, content, texts, skipped)
                 pick = store.get_model_pick(message.author.id)
                 result = await self.agent.run(
-                    self._system_prompt(message.guild), prompt, ctx.tools(), images, owner=owner, pick=pick
+                    self._system_prompt(message.guild), prompt, ctx.tools(), media, owner=owner, pick=pick
                 )
             if result is None:
                 response, tag = "My brain is fried right now, try again in a bit 😵", None
             else:
                 response, answered_by, used = result
                 response = discord_md.to_discord(self._fix_emojis(response, message.guild))
-                tag = self._model_tag(answered_by, used, pick)
+                tag = self._model_tag(answered_by, used, pick, pdf=any(a.mime == PDF for a in media))
             chunks = discord_md.split(response)
             # AI output never pings anyone.
             no_pings = discord.AllowedMentions.none()
