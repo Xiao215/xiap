@@ -1,5 +1,8 @@
 """Button-based polls with live results."""
 
+import contextlib
+from collections import Counter
+
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -8,7 +11,7 @@ BAR_LENGTH = 12
 
 
 class PollView(discord.ui.View):
-    def __init__(self, question: str, options: list[str], author: discord.User):
+    def __init__(self, question: str, options: list[str], author: discord.abc.User) -> None:
         super().__init__(timeout=24 * 3600)
         self.question = question
         self.options = options
@@ -30,23 +33,26 @@ class PollView(discord.ui.View):
 
     def build_embed(self, closed: bool = False) -> discord.Embed:
         total = len(self.votes)
+        tally = Counter(self.votes.values())
         lines = []
         for i, option in enumerate(self.options):
-            count = sum(1 for v in self.votes.values() if v == i)
+            count = tally[i]
             filled = round(BAR_LENGTH * count / total) if total else 0
             bar = "█" * filled + "░" * (BAR_LENGTH - filled)
             lines.append(f"**{option}**\n{bar} {count} vote{'s' if count != 1 else ''}")
         embed = discord.Embed(
-            title=("📊 " if not closed else "📊 [CLOSED] ") + self.question,
+            title=("📊 [CLOSED] " if closed else "📊 ") + self.question,
             description="\n".join(lines),
-            color=discord.Color.blurple() if not closed else discord.Color.greyple(),
+            color=discord.Color.greyple() if closed else discord.Color.blurple(),
         )
         embed.set_footer(text=f"{total} vote{'s' if total != 1 else ''} • started by {self.author.display_name}")
         return embed
 
     async def on_timeout(self) -> None:
         if self.message:
-            await self.message.edit(embed=self.build_embed(closed=True), view=None)
+            # The poll message may have been deleted in the meantime.
+            with contextlib.suppress(discord.HTTPException):
+                await self.message.edit(embed=self.build_embed(closed=True), view=None)
 
 
 class PollCog(commands.Cog):

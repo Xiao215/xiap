@@ -21,6 +21,11 @@ __pycache__/
 .dockerignore
 Dockerfile
 
+# Ignore local bot settings and tooling
+data.json*
+.claude/
+.venv/
+
 # Ignore system files (macOS, VSCode, IDE settings, etc.)
 .DS_Store
 .vscode/

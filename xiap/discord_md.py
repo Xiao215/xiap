@@ -18,6 +18,7 @@ DEEP_HEADER_RE = re.compile(r"^ {0,3}#{4,6}[ \t]+(.+?)[ \t#]*$")
 SEPARATOR_CELL_RE = re.compile(r"^:?-+:?$")
 CELL_SPLIT_RE = re.compile(r"(?<!\\)\|")
 EMOJI_TOKEN_RE = re.compile(r"<a?(:\w+:)\d+>")
+BRACKETED_URL_RE = re.compile(r"<(https?://[^>]+)>")
 LINK_RE = re.compile(r"\[([^\]]+)\]\(<?[^)\s>]+>?\)")
 EMPHASIS_RE = re.compile(r"(\*\*|__|~~|\|\||`|(?<!\w)[*_](?=\S)|(?<=\S)[*_](?!\w))")
 FENCE_LANG_RE = re.compile(r"```(\w*)")
@@ -31,8 +32,9 @@ def to_discord(text: str) -> str:
     i = 0
     while i < len(lines):
         line = lines[i]
-        if in_code or line.count("```") % 2:
-            if line.count("```") % 2:
+        toggles_fence = line.count("```") % 2 == 1
+        if in_code or toggles_fence:
+            if toggles_fence:
                 in_code = not in_code
             out.append(line)
             i += 1
@@ -118,6 +120,7 @@ def _alignments(line: str) -> list[str]:
         if cell.startswith(":") and cell.endswith(":"):
             return "center"
         return "right" if cell.endswith(":") else "left"
+
     return [align(c) for c in _cells(line)]
 
 
@@ -125,7 +128,7 @@ def _plain(cell: str) -> str:
     """Strip inline markdown, which would show literally inside a code block."""
     cell = LINK_RE.sub(r"\1", cell)
     cell = EMOJI_TOKEN_RE.sub(r"\1", cell)
-    cell = re.sub(r"<(https?://[^>]+)>", r"\1", cell)
+    cell = BRACKETED_URL_RE.sub(r"\1", cell)
     return EMPHASIS_RE.sub("", cell)
 
 
@@ -160,7 +163,9 @@ def _render_table(header: list[str], align: list[str], rows: list[list[str]]) ->
     out = []
     for r in rows:
         title = r[0].strip("*") if r[0].startswith("**") and r[0].endswith("**") else r[0]
-        fields = [f"{h}: {c}" if _plain(h) else c for h, c in zip(header[1:], r[1:]) if c]
-        title = f"**{title}**" if title else ""
-        out.append(f"- {title}" + (" — " * bool(title) + " · ".join(fields) if fields else ""))
+        fields = [f"{h}: {c}" if _plain(h) else c for h, c in zip(header[1:], r[1:], strict=True) if c]
+        line = f"- **{title}**" if title else "-"
+        if fields:
+            line += (" — " if title else " ") + " · ".join(fields)
+        out.append(line)
     return out

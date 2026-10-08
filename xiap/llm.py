@@ -1,17 +1,18 @@
 """Tool-calling agent loop over Gemini, Cohere and (owner only) Claude.
 
 The model gets a system prompt, the user's message (plus any images and PDFs)
-and a set of tools. Each round it either answers or asks for tools; we run them, hand back the results
-and repeat until it answers (or runs out of rounds, at which point tools are
-switched off so it has to answer with what it has).
+and a set of tools. Each round it either answers or asks for tools; we run
+them, hand back the results and repeat until it answers (or runs out of
+rounds, at which point tools are switched off so it has to answer with what it
+has).
 
 Gemini and Cohere round-robin across their configured API keys. Claude goes
 through the owner's local claude-api server (Anthropic Messages format) and is
 only ever used for the owner's own messages — a Pro/Max plan is for personal
-use. Cohere can't read PDFs, so when one is attached the providers that can
-go first. If a provider fails outright, or takes longer than its deadline, the whole
-run restarts on the next. Tools are read-only, so re-running them on failover
-is harmless.
+use. Cohere can't read PDFs, so when one is attached the providers that can go
+first. If a provider fails outright, or takes longer than its deadline, the
+whole run restarts on the next. Tools are read-only, so re-running them on
+failover is harmless.
 """
 
 import asyncio
@@ -20,8 +21,9 @@ import json
 import logging
 import re
 import time
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 import aiohttp
 import cohere
@@ -43,13 +45,11 @@ MODEL_LIST_RETRY = 60
 # Tool results are truncated to this many characters so one call can't blow up the prompt.
 MAX_TOOL_RESULT_CHARS = 6000
 
-
-def _describe(e: BaseException) -> str:
-    """Error text for logs; timeouts and some network errors have an empty str()."""
-    return str(e) or type(e).__name__
-
-
 PDF = "application/pdf"
+GEMINI_TYPES = {"image/png", "image/jpeg", "image/webp", "image/heic", "image/heif", PDF}
+CLAUDE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp", PDF}
+# Providers that read PDFs (every Gemini chat model does, and Claude does).
+PDF_PROVIDERS = {"gemini", "claude"}
 
 
 @dataclass
@@ -64,10 +64,12 @@ class Attachment:
         return base64.b64encode(self.data).decode()
 
 
-GEMINI_TYPES = {"image/png", "image/jpeg", "image/webp", "image/heic", "image/heif", PDF}
-CLAUDE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp", PDF}
-# Providers that read PDFs (every Gemini chat model does, and Claude does).
-PDF_PROVIDERS = {"gemini", "claude"}
+@dataclass
+class Tool:
+    name: str
+    description: str
+    parameters: dict  # JSON schema for the arguments object
+    run: Callable[..., Awaitable[str]]
 
 
 def reads_pdfs(label: str) -> bool:
@@ -75,26 +77,42 @@ def reads_pdfs(label: str) -> bool:
     return label.partition(":")[0] in PDF_PROVIDERS
 
 
+def _describe(e: BaseException) -> str:
+    """Error text for logs; timeouts and some network errors have an empty str()."""
+    return str(e) or type(e).__name__
+
+
+async def _read_json(resp: aiohttp.ClientResponse) -> dict:
+    """The JSON body of a successful response; raises with the API's error message otherwise."""
+    data = await resp.json()
+    if resp.status != 200:
+        raise RuntimeError(data.get("error", {}).get("message", f"HTTP {resp.status}"))
+    return data
+
+
+def _claude_url(endpoint: str) -> str:
+    return f"{config.CLAUDE_API_URL.rstrip('/')}/v1/{endpoint}"
+
+
+def _claude_headers() -> dict[str, str]:
+    headers = {"anthropic-version": "2023-06-01"}
+    if config.CLAUDE_API_KEY:
+        headers["x-api-key"] = config.CLAUDE_API_KEY
+    return headers
+
+
 def _attachment_note(attachments: list[Attachment], supported: set[str]) -> str:
     """Tell the model about attached files it won't be able to see."""
     skipped = [a for a in attachments if a.mime not in supported]
-    pdfs = sum(a.mime == PDF for a in skipped)
-    images = len(skipped) - pdfs
     if not skipped:
         return ""
+    pdfs = sum(a.mime == PDF for a in skipped)
+    images = len(skipped) - pdfs
     what = " and ".join(f"{n} {kind}" for n, kind in ((images, "image(s)"), (pdfs, "PDF(s)")) if n)
     return (
         f"\n\n({what} attached couldn't be shown to you — don't pretend to see them. If they matter "
         "to the question, say you can't read them.)"
     )
-
-
-@dataclass
-class Tool:
-    name: str
-    description: str
-    parameters: dict  # JSON schema for the arguments object
-    run: Callable[..., Awaitable[str]]
 
 
 class KeyRing:
@@ -137,26 +155,24 @@ class Agent:
             else None
         )
 
-        # Ordered provider list: primary first, the other as fallback. Claude is
-        # kept separate and only put in front for the owner's messages.
-        self.claude = self._run_claude if config.CLAUDE_API_URL else None
-        available = {}
-        if self.gemini_keys:
-            available["gemini"] = self._run_gemini
-        if self.cohere_clients:
-            available["cohere"] = self._run_cohere
+        self.claude_enabled = bool(config.CLAUDE_API_URL)
+
+        # Providers for everyone, primary first and the other as fallback.
+        # Claude isn't one of them: it's only put in front for the owner.
+        available = [p for p in ("gemini", "cohere") if self.configured(p)]  # "auto" prefers Gemini
         if config.CHAT_PROVIDER in available:
-            order = [config.CHAT_PROVIDER] + [n for n in available if n != config.CHAT_PROVIDER]
-        else:  # "auto": prefer Gemini's daily-resetting free tier
-            order = list(available)
-        self.providers = [(name, available[name]) for name in order]
-        log.info("Chat providers (in order): %s", [n for n, _ in self.providers] or "NONE")
+            available.remove(config.CHAT_PROVIDER)
+            available.insert(0, config.CHAT_PROVIDER)
+        self.providers: list[str] = available
+        log.info("Chat providers (in order): %s", self.providers or "NONE")
         self._runners = {"gemini": self._run_gemini, "cohere": self._run_cohere, "claude": self._run_claude}
         # provider -> (monotonic time it expires, models)
         self._model_lists: dict[str, tuple[float, list[str]]] = {}
 
     def configured(self, provider: str) -> bool:
-        return bool({"gemini": self.gemini_keys, "cohere": self.cohere_clients, "claude": self.claude}.get(provider))
+        return bool(
+            {"gemini": self.gemini_keys, "cohere": self.cohere_clients, "claude": self.claude_enabled}.get(provider)
+        )
 
     @staticmethod
     def default_model(provider: str) -> str:
@@ -172,9 +188,9 @@ class Agent:
             provider, _, model = pick.partition(":")
             if self.configured(provider) and (provider != "claude" or owner):
                 chain.append((provider, model))
-        if owner and self.claude:
+        if owner and self.claude_enabled:
             chain.append(("claude", config.CLAUDE_MODEL))
-        chain += [(name, self.default_model(name)) for name, _ in self.providers]
+        chain += [(name, self.default_model(name)) for name in self.providers]
         chain = list(dict.fromkeys(chain))  # dedupe, keep order
         if pdf:  # stable sort: PDF readers first, order otherwise kept
             chain.sort(key=lambda pm: pm[0] not in PDF_PROVIDERS)
@@ -192,7 +208,7 @@ class Agent:
         stale = [p for p in providers if self._model_lists.get(p, (0.0, []))[0] <= now]
         # Fetch in parallel: /model autocomplete must answer Discord within 3s.
         results = await asyncio.gather(*(fetchers[p]() for p in stale), return_exceptions=True)
-        for provider, result in zip(stale, results):
+        for provider, result in zip(stale, results, strict=True):
             if isinstance(result, BaseException):  # a provider being down shouldn't hide the others
                 log.warning("Couldn't list %s models: %s", provider, _describe(result))
                 fallback = [m for m in [self.default_model(provider)] if m]
@@ -204,9 +220,7 @@ class Agent:
     async def _list_gemini(self) -> list[str]:
         headers = {"x-goog-api-key": self.gemini_keys.items[0]}
         async with self.http.get(GEMINI_MODELS_URL, headers=headers) as resp:
-            data = await resp.json()
-            if resp.status != 200:
-                raise RuntimeError(data.get("error", {}).get("message", f"HTTP {resp.status}"))
+            data = await _read_json(resp)
         names = [m["name"].removeprefix("models/") for m in data.get("models", [])]
         names = [n for n in names if GEMINI_CHAT_RE.match(n)]
         if not config.GEMINI_LIST_PRO:
@@ -218,12 +232,9 @@ class Agent:
         return sorted((m.name for m in res.models or [] if m.name), reverse=True)
 
     async def _list_claude(self) -> list[str]:
-        url = config.CLAUDE_API_URL.rstrip("/") + "/v1/models"
-        headers = {"x-api-key": config.CLAUDE_API_KEY} if config.CLAUDE_API_KEY else {}
-        async with self.http.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=2)) as resp:
-            data = await resp.json()
-            if resp.status != 200:
-                raise RuntimeError(data.get("error", {}).get("message", f"HTTP {resp.status}"))
+        timeout = aiohttp.ClientTimeout(total=2)
+        async with self.http.get(_claude_url("models"), headers=_claude_headers(), timeout=timeout) as resp:
+            data = await _read_json(resp)
         return [m["id"] for m in data.get("data", [])]
 
     async def run(
@@ -231,7 +242,7 @@ class Agent:
         system: str,
         prompt: str,
         tools: list[Tool],
-        attachments: list[Attachment] = (),
+        attachments: Sequence[Attachment] = (),
         owner: bool = False,
         pick: str | None = None,
     ) -> tuple[str, str, str] | None:
@@ -263,10 +274,8 @@ class Agent:
         for key in self.gemini_keys.rotation():
             try:
                 async with self.http.post(url, headers={"x-goog-api-key": key}, json=payload) as resp:
-                    data = await resp.json()
-                    if resp.status != 200:
-                        raise RuntimeError(data.get("error", {}).get("message", f"HTTP {resp.status}"))
-                    return data["candidates"][0]["content"]
+                    data = await _read_json(resp)
+                return data["candidates"][0]["content"]
             except Exception as e:  # noqa: BLE001 — rotate to the next key on any API failure
                 last_error = e
                 log.warning("Gemini request failed, rotating key: %s", _describe(e))
@@ -275,13 +284,13 @@ class Agent:
     async def _run_gemini(
         self, system: str, prompt: str, tools: dict[str, Tool], attachments: list[Attachment], model: str
     ) -> tuple[str, str]:
-        parts = [
+        user_parts = [
             {"inline_data": {"mime_type": a.mime, "data": a.b64()}}
             for a in attachments
             if a.mime in GEMINI_TYPES
         ]
-        parts.append({"text": prompt + _attachment_note(attachments, GEMINI_TYPES)})
-        contents: list[dict] = [{"role": "user", "parts": parts}]
+        user_parts.append({"text": prompt + _attachment_note(attachments, GEMINI_TYPES)})
+        contents: list[dict] = [{"role": "user", "parts": user_parts}]
         declarations = [
             {"name": t.name, "description": t.description, "parameters": t.parameters}
             for t in tools.values()
@@ -375,21 +384,16 @@ class Agent:
                 messages.append({"role": "tool", "tool_call_id": call.id, "content": json.dumps({"result": result})})
         raise RuntimeError("no answer after tool rounds")
 
-    # --- Claude (owner only, via the local claude-api server) ---------------------
+    # --- Claude (owner only, via the local claude-api server) -----------------
 
     async def _claude_request(self, body: dict) -> dict:
-        headers = {"anthropic-version": "2023-06-01"}
-        if config.CLAUDE_API_KEY:
-            headers["x-api-key"] = config.CLAUDE_API_KEY
         # Each round runs the `claude` CLI, which can take a while (and longer
         # with web search), so allow more than the shared session's default.
         timeout = aiohttp.ClientTimeout(total=config.CLAUDE_TIMEOUT)
-        url = config.CLAUDE_API_URL.rstrip("/") + "/v1/messages"
-        async with self.http.post(url, headers=headers, json=body, timeout=timeout) as resp:
-            data = await resp.json()
-            if resp.status != 200:
-                raise RuntimeError(data.get("error", {}).get("message", f"HTTP {resp.status}"))
-            return data
+        async with self.http.post(
+            _claude_url("messages"), headers=_claude_headers(), json=body, timeout=timeout
+        ) as resp:
+            return await _read_json(resp)
 
     async def _run_claude(
         self, system: str, prompt: str, tools: dict[str, Tool], attachments: list[Attachment], model: str
@@ -435,3 +439,4 @@ class Agent:
                 results.append({"type": "tool_result", "tool_use_id": call["id"], "content": result})
             messages.append({"role": "user", "content": results})
         raise RuntimeError("no answer after tool rounds")
+

@@ -83,3 +83,6 @@ TIMEZONE = os.getenv("TIMEZONE", "America/Toronto")
 
 # Port for the tiny HTTP health-check server (Cloud Run & friends).
 PORT = int(os.getenv("PORT", "8080"))
+
+# Where /context, /optout, /model and /papers settings are saved.
+DATA_FILE = os.getenv("DATA_FILE", "data.json")

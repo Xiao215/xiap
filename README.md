@@ -1,6 +1,6 @@
 # xiap 🤖
 
-A friendly AI Discord bot for the Sunday Social group chat. Mention it (or reply to it) and it chats back using Cohere, complete with your server's custom emojis — plus a bag of party tricks for the group.
+A friendly AI Discord bot for the Sunday Social group chat. Mention it (or reply to it) and it chats back using Gemini or Cohere, complete with your server's custom emojis — plus a bag of party tricks for the group.
 
 ## Features
 
@@ -13,6 +13,7 @@ A friendly AI Discord bot for the Sunday Social group chat. Mention it (or reply
 | Command | What it does |
 |---|---|
 | `/stock [symbol] [period]` | Price chart image for any ticker (default: SPY / S&P 500), data from Yahoo Finance |
+| `/papers today`, `/papers subscribe` | Trending AI papers from Hugging Face, on demand or as a daily digest in a channel |
 | `/poll` | Button-based poll (up to 5 options) with a live results bar |
 | `/remind 1h30m <text>` | Pings you in the channel when time's up |
 | `/choose a, b, c` | Can't decide? The bot picks |
@@ -28,7 +29,7 @@ A friendly AI Discord bot for the Sunday Social group chat. Mention it (or reply
 3. Configure and run:
 
 ```bash
-cp .env.example .env   # fill in DISCORD_TOKEN and COHERE_API_KEYS
+cp .env.example .env   # fill in DISCORD_TOKEN and GEMINI_API_KEYS and/or COHERE_API_KEYS
 pip install -r requirements.txt
 python app.py
 ```
@@ -59,14 +60,18 @@ app.py                 entry point
 xiap/
   bot.py               XiapBot, cog loading, slash-command sync
   config.py            env/config
-  llm.py               tool-calling agent loop over Gemini/Cohere
+  store.py             JSON-file settings store (data.json)
+  llm.py               tool-calling agent loop over Gemini/Cohere/Claude
   discord_md.py        fixes model markdown for Discord (tables, rules), fence-safe splitting
   web.py               aiohttp health-check server
   cogs/
     chat.py            AI chat (mentions & replies) and its context tools
     models.py          /models, /model: per-user model choice
-    fun.py             rps, roll, 8ball, coinflip, choose, ship
+    privacy.py         /context, /optout, /optin
+    papers.py          /papers: Hugging Face daily papers digest
+    stocks.py          /stock price charts
+    fun.py             /choose
     polls.py           button polls
     reminders.py       /remind
-    newsletter.py      Firestore subscribe/unsubscribe (optional)
+    help.py            /help
 ```

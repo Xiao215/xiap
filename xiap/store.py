@@ -2,12 +2,13 @@
 
 import json
 import logging
-import os
 from pathlib import Path
+
+from xiap import config
 
 log = logging.getLogger(__name__)
 
-PATH = Path(os.getenv("DATA_FILE", "data.json"))
+PATH = Path(config.DATA_FILE)
 
 
 class Store:
@@ -19,9 +20,6 @@ class Store:
         try:
             data = json.loads(PATH.read_text())
             self.context_limit = {int(k): v for k, v in data.get("context_limit", {}).items()}
-            # Migrate the old on/off format: "off" channels become a limit of 0.
-            for channel_id in data.get("context_off", []):
-                self.context_limit.setdefault(int(channel_id), 0)
             self.optout = set(data.get("optout", []))
             self.paper_subs = {int(k): v for k, v in data.get("paper_subs", {}).items()}
             self.model_pick = {int(k): v for k, v in data.get("model_pick", {}).items()}
@@ -31,23 +29,26 @@ class Store:
             log.exception("Failed to load %s, starting with defaults", PATH)
 
     def _save(self) -> None:
-        PATH.write_text(
-            json.dumps({
-                "context_limit": {str(k): v for k, v in self.context_limit.items()},
-                "optout": sorted(self.optout),
-                "paper_subs": {str(k): v for k, v in self.paper_subs.items()},
-                "model_pick": {str(k): v for k, v in self.model_pick.items()},
-            })
-        )
+        data = {
+            "context_limit": {str(k): v for k, v in self.context_limit.items()},
+            "optout": sorted(self.optout),
+            "paper_subs": {str(k): v for k, v in self.paper_subs.items()},
+            "model_pick": {str(k): v for k, v in self.model_pick.items()},
+        }
+        # Write then rename, so a crash mid-write can't leave a truncated file.
+        tmp = PATH.with_name(PATH.name + ".tmp")
+        tmp.write_text(json.dumps(data))
+        tmp.replace(PATH)
 
     def set_paper_sub(self, channel_id: int, topic: str) -> None:
         self.paper_subs[channel_id] = topic
         self._save()
 
     def remove_paper_sub(self, channel_id: int) -> bool:
-        existed = self.paper_subs.pop(channel_id, None) is not None
+        if self.paper_subs.pop(channel_id, None) is None:
+            return False
         self._save()
-        return existed
+        return True
 
     def set_model_pick(self, user_id: int, pick: str | None) -> None:
         if pick:
@@ -67,7 +68,10 @@ class Store:
         return self.context_limit.get(channel_id, default)
 
     def set_optout(self, user_id: int, opted_out: bool) -> None:
-        (self.optout.add if opted_out else self.optout.discard)(user_id)
+        if opted_out:
+            self.optout.add(user_id)
+        else:
+            self.optout.discard(user_id)
         self._save()
 
     def is_opted_out(self, user_id: int) -> bool:

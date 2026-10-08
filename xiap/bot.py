@@ -3,6 +3,7 @@
 import logging
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 from xiap import config
@@ -34,7 +35,12 @@ class XiapBot(commands.Bot):
             allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=True),
         )
         self._synced = False
-        self._all_commands: list = []
+        self._all_commands: list[app_commands.Command | app_commands.Group] = []
+
+    def visible_commands(self, guild: discord.Guild | None) -> list[app_commands.Command | app_commands.Group]:
+        """Slash commands, sorted by name: global ones until on_ready moves them to each guild."""
+        commands_list = self.tree.get_commands(guild=guild) or self.tree.get_commands()
+        return sorted(commands_list, key=lambda c: c.name)
 
     async def setup_hook(self) -> None:
         await start_health_server(config.PORT)

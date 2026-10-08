@@ -17,13 +17,10 @@ class HelpCog(commands.Cog):
                 "when I need more context, and I know this server's custom emojis."
             ),
         )
-        tree = interaction.client.tree
-        commands_list = sorted(
-            tree.get_commands(guild=interaction.guild) or tree.get_commands(),
-            key=lambda c: c.name,
-        )
         lines = [
-            f"`/{c.name}` — {c.description}" for c in commands_list if c.name != "help"
+            f"`/{c.name}` — {c.description}"
+            for c in interaction.client.visible_commands(interaction.guild)
+            if c.name != "help"
         ]
         embed.add_field(name="⚡ Slash commands", value="\n".join(lines), inline=False)
         embed.set_footer(text="Tip: type / in the message box to see every command with its options")

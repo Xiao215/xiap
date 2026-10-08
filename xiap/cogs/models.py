@@ -10,6 +10,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from xiap.llm import Agent
 from xiap.store import store
 
 PROVIDER_NAMES = {"gemini": "Gemini", "cohere": "Cohere", "claude": "Claude (owner only)"}
@@ -20,19 +21,22 @@ class ModelsCog(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
 
+    @property
+    def _agent(self) -> Agent | None:
+        chat = self.bot.get_cog("ChatCog")
+        return chat.agent if chat else None
+
     async def _choices(self, user: discord.abc.User) -> dict[str, list[str]] | None:
         """Models this user may pick, by provider; None if AI chat isn't set up."""
-        chat = self.bot.get_cog("ChatCog")
-        if chat is None or chat.agent is None:
+        if self._agent is None:
             return None
-        lists = await chat.agent.list_models()
-        if "claude" in lists and not await chat.is_owner(user):
-            lists = {p: models for p, models in lists.items() if p != "claude"}
+        lists = await self._agent.list_models()
+        if "claude" in lists and not await self.bot.get_cog("ChatCog").is_owner(user):
+            del lists["claude"]
         return lists
 
     def _default_label(self, owner: bool) -> str:
-        agent = self.bot.get_cog("ChatCog").agent
-        chain = agent.chain(owner=owner)
+        chain = self._agent.chain(owner=owner)
         if not chain:
             return "nothing configured"
         provider, model = chain[0]
@@ -56,9 +60,8 @@ class ModelsCog(commands.Cog):
                 + "\nSwitch with `/model`, or `/model default` to go back. Only affects replies to you."
             ),
         )
-        agent = self.bot.get_cog("ChatCog").agent
         for provider, names in lists.items():
-            default = agent.default_model(provider)
+            default = self._agent.default_model(provider)
             lines = []
             for name in names:
                 marks = (" ✅" if pick == f"{provider}:{name}" else "") + (" ⭐" if name == default else "")
@@ -76,16 +79,17 @@ class ModelsCog(commands.Cog):
         if not lists:
             await interaction.followup.send("AI chat isn't set up on this bot.", ephemeral=True)
             return
-        if model.strip().lower() == DEFAULT:
+        model = model.strip()
+        if model.lower() == DEFAULT:
             store.set_model_pick(interaction.user.id, None)
             label = self._default_label("claude" in lists)
             await interaction.followup.send(f"🔄 Back to the default: `{label}`.", ephemeral=True)
             return
 
-        provider, _, name = model.strip().partition(":")
+        provider, _, name = model.partition(":")
         if not name:  # bare model name: find which provider has it
-            provider = next((p for p, names in lists.items() if model.strip() in names), "")
-            name = model.strip()
+            provider = next((p for p, names in lists.items() if model in names), "")
+            name = model
         if name not in lists.get(provider, []):
             await interaction.followup.send(
                 f"❓ `{model}` isn't one of your options — see `/models`.", ephemeral=True

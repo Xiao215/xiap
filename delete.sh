@@ -1,1 +1,0 @@
-gcloud run services delete discord-bot --region=us-central1

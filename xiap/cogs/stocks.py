@@ -7,17 +7,14 @@ the chart is rendered with matplotlib and attached as an image.
 import asyncio
 import io
 import logging
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 
 import aiohttp
 import discord
-import matplotlib
+import matplotlib.dates as mdates
 from discord import app_commands
 from discord.ext import commands
-
-matplotlib.use("Agg")
-import matplotlib.dates as mdates  # noqa: E402
-import matplotlib.pyplot as plt  # noqa: E402
+from matplotlib.figure import Figure
 
 log = logging.getLogger(__name__)
 
@@ -26,11 +23,11 @@ USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
 
 GREEN = "#2ecc71"
 RED = "#e74c3c"
+BACKGROUND = "#2b2d31"  # Discord's dark theme
 
 
 class StockCog(commands.Cog):
-    def __init__(self, bot: commands.Bot) -> None:
-        self.bot = bot
+    def __init__(self) -> None:
         self.http: aiohttp.ClientSession | None = None
 
     async def cog_load(self) -> None:
@@ -87,7 +84,7 @@ class StockCog(commands.Cog):
             color=discord.Color.green() if up else discord.Color.red(),
         )
         embed.set_image(url="attachment://chart.png")
-        embed.set_footer(text=f"Daily close · data: stooq.com · {window[-1][0].isoformat()}")
+        embed.set_footer(text=f"Daily close · data: Yahoo Finance · {window[-1][0].isoformat()}")
         await interaction.followup.send(embed=embed, file=discord.File(buf, "chart.png"))
 
     async def _fetch(self, ticker: str, yahoo_range: str) -> list[tuple[date, float]]:
@@ -101,8 +98,8 @@ class StockCog(commands.Cog):
         timestamps = result[0].get("timestamp") or []
         closes = result[0]["indicators"]["quote"][0].get("close") or []
         return [
-            (datetime.fromtimestamp(ts, tz=timezone.utc).date(), c)
-            for ts, c in zip(timestamps, closes)
+            (datetime.fromtimestamp(ts, tz=UTC).date(), c)
+            for ts, c in zip(timestamps, closes, strict=False)
             if c is not None
         ]
 
@@ -112,9 +109,10 @@ class StockCog(commands.Cog):
         closes = [c for _, c in window]
         color = GREEN if up else RED
 
-        fig, ax = plt.subplots(figsize=(8, 4), dpi=150)
-        fig.patch.set_facecolor("#2b2d31")  # match Discord dark theme
-        ax.set_facecolor("#2b2d31")
+        # A bare Figure, not pyplot: this runs in a worker thread and pyplot's global state isn't thread-safe.
+        fig = Figure(figsize=(8, 4), dpi=150, facecolor=BACKGROUND)
+        ax = fig.subplots()
+        ax.set_facecolor(BACKGROUND)
         ax.plot(dates, closes, color=color, linewidth=1.8)
         ax.fill_between(dates, closes, min(closes), color=color, alpha=0.15)
         ax.grid(color="#4e5058", linewidth=0.5, alpha=0.5)
@@ -127,10 +125,9 @@ class StockCog(commands.Cog):
 
         buf = io.BytesIO()
         fig.savefig(buf, format="png", facecolor=fig.get_facecolor())
-        plt.close(fig)
         buf.seek(0)
         return buf
 
 
 async def setup(bot: commands.Bot) -> None:
-    await bot.add_cog(StockCog(bot))
+    await bot.add_cog(StockCog())

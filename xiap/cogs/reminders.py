@@ -1,6 +1,7 @@
 """Lightweight reminders: /remind 1h30m take the pizza out of the oven."""
 
 import asyncio
+import contextlib
 import re
 
 import discord
@@ -9,7 +10,8 @@ from discord.ext import commands
 
 DURATION_RE = re.compile(r"(\d+)\s*([dhms])", re.IGNORECASE)
 UNIT_SECONDS = {"d": 86400, "h": 3600, "m": 60, "s": 1}
-MAX_SECONDS = 7 * 86400
+MAX_DAYS = 7
+MAX_SECONDS = MAX_DAYS * UNIT_SECONDS["d"]
 
 
 def parse_duration(text: str) -> int | None:
@@ -22,8 +24,7 @@ def parse_duration(text: str) -> int | None:
 class ReminderCog(commands.Cog):
     """In-memory reminders — they survive as long as the bot stays up."""
 
-    def __init__(self, bot: commands.Bot) -> None:
-        self.bot = bot
+    def __init__(self) -> None:
         self.tasks: set[asyncio.Task] = set()
 
     def cog_unload(self) -> None:
@@ -44,7 +45,7 @@ class ReminderCog(commands.Cog):
             )
             return
         if seconds > MAX_SECONDS:
-            await interaction.response.send_message("Max reminder is 7 days!", ephemeral=True)
+            await interaction.response.send_message(f"Max reminder is {MAX_DAYS} days!", ephemeral=True)
             return
 
         await interaction.response.send_message(f"⏰ Got it! I'll remind you in **{duration}**: {text}")
@@ -54,11 +55,9 @@ class ReminderCog(commands.Cog):
 
     async def _fire(self, interaction: discord.Interaction, seconds: int, text: str) -> None:
         await asyncio.sleep(seconds)
-        try:
+        with contextlib.suppress(discord.HTTPException):
             await interaction.channel.send(f"⏰ {interaction.user.mention} Reminder: {text}")
-        except discord.HTTPException:
-            pass
 
 
 async def setup(bot: commands.Bot) -> None:
-    await bot.add_cog(ReminderCog(bot))
+    await bot.add_cog(ReminderCog())

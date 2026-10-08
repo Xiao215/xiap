@@ -41,6 +41,7 @@ class PapersCog(commands.Cog):
 
     async def _fetch(self) -> list[dict]:
         async with self.http.get(API_URL) as resp:
+            resp.raise_for_status()
             data = await resp.json()
         papers = [entry["paper"] for entry in data if "paper" in entry]
         return sorted(papers, key=lambda p: p.get("upvotes", 0), reverse=True)
@@ -59,11 +60,7 @@ class PapersCog(commands.Cog):
         title = "📚 Today's trending papers"
         if topic:
             title += f" · {topic}"
-        embed = discord.Embed(
-            title=title,
-            color=discord.Color.orange(),
-            timestamp=datetime.datetime.now(datetime.timezone.utc),
-        )
+        embed = discord.Embed(title=title, color=discord.Color.orange(), timestamp=discord.utils.utcnow())
         for p in selected:
             authors = ", ".join(a.get("name", "?") for a in p.get("authors", [])[:3])
             if len(p.get("authors", [])) > 3:
@@ -92,7 +89,7 @@ class PapersCog(commands.Cog):
         except Exception:
             log.exception("Papers fetch failed")
             papers = []
-        embed = self._build_embed(papers, topic) if papers else None
+        embed = self._build_embed(papers, topic)
         if embed is None:
             await interaction.followup.send(
                 f"No trending papers found{f' for `{topic}`' if topic else ''} today 😕"
@@ -135,9 +132,10 @@ class PapersCog(commands.Cog):
                 store.remove_paper_sub(channel_id)
                 continue
             embed = self._build_embed(papers, topic)
+            if embed is None:
+                continue
             try:
-                if embed is not None:
-                    await channel.send(embed=embed)
+                await channel.send(embed=embed)
             except discord.HTTPException:
                 log.exception("Failed to post papers digest in %d", channel_id)
 
