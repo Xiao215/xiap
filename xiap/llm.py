@@ -184,7 +184,9 @@ class Agent:
         """Chat models each configured provider offers, each cached for an hour
         (a failed listing only for a minute, so it's retried soon).
         Includes Claude when configured — callers must only show it to the owner."""
-        fetchers = {"gemini": self._list_gemini, "cohere": self._list_cohere, "claude": self._list_claude}
+        # Claude first: it's the owner's default, and in /model's autocomplete
+        # it would otherwise sit below a dozen Gemini models, out of view.
+        fetchers = {"claude": self._list_claude, "gemini": self._list_gemini, "cohere": self._list_cohere}
         providers = [p for p in fetchers if self.configured(p)]
         now = time.monotonic()
         stale = [p for p in providers if self._model_lists.get(p, (0.0, []))[0] <= now]
