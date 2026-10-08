@@ -35,7 +35,10 @@ GEMINI_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models?pag
 # The Gemini catalogue also lists TTS, image, music, robotics… models; keep the
 # chat ones: gemini-<version>-pro/flash/flash-lite, optionally -preview, and the -latest aliases.
 GEMINI_CHAT_RE = re.compile(r"^gemini-(\d[\d.]*-)?(pro|flash|flash-lite)(-preview)?(-latest)?$")
-MODEL_LIST_TTL = 3600  # seconds to cache the model lists
+MODEL_LIST_TTL = 3600  # seconds to cache a provider's model list
+# A failed listing (e.g. the claude-api server isn't up yet) is retried this
+# soon instead of hiding that provider's models for the full hour.
+MODEL_LIST_RETRY = 60
 
 # Tool results are truncated to this many characters so one call can't blow up the prompt.
 MAX_TOOL_RESULT_CHARS = 6000
@@ -149,8 +152,8 @@ class Agent:
         self.providers = [(name, available[name]) for name in order]
         log.info("Chat providers (in order): %s", [n for n, _ in self.providers] or "NONE")
         self._runners = {"gemini": self._run_gemini, "cohere": self._run_cohere, "claude": self._run_claude}
-        self._model_lists: dict[str, list[str]] = {}
-        self._model_lists_at = 0.0
+        # provider -> (monotonic time it expires, models)
+        self._model_lists: dict[str, tuple[float, list[str]]] = {}
 
     def configured(self, provider: str) -> bool:
         return bool({"gemini": self.gemini_keys, "cohere": self.cohere_clients, "claude": self.claude}.get(provider))
@@ -178,22 +181,23 @@ class Agent:
         return chain
 
     async def list_models(self) -> dict[str, list[str]]:
-        """Chat models each configured provider offers, cached for an hour.
+        """Chat models each configured provider offers, each cached for an hour
+        (a failed listing only for a minute, so it's retried soon).
         Includes Claude when configured — callers must only show it to the owner."""
-        if self._model_lists and time.monotonic() - self._model_lists_at < MODEL_LIST_TTL:
-            return self._model_lists
-        lists: dict[str, list[str]] = {}
         fetchers = {"gemini": self._list_gemini, "cohere": self._list_cohere, "claude": self._list_claude}
-        for provider, fetch in fetchers.items():
-            if not self.configured(provider):
-                continue
-            try:
-                lists[provider] = await fetch()
-            except Exception as e:  # noqa: BLE001 — a provider being down shouldn't hide the others
-                log.warning("Couldn't list %s models: %s", provider, e)
-                lists[provider] = [m for m in [self.default_model(provider)] if m]
-        self._model_lists, self._model_lists_at = lists, time.monotonic()
-        return lists
+        providers = [p for p in fetchers if self.configured(p)]
+        now = time.monotonic()
+        stale = [p for p in providers if self._model_lists.get(p, (0.0, []))[0] <= now]
+        # Fetch in parallel: /model autocomplete must answer Discord within 3s.
+        results = await asyncio.gather(*(fetchers[p]() for p in stale), return_exceptions=True)
+        for provider, result in zip(stale, results):
+            if isinstance(result, BaseException):  # a provider being down shouldn't hide the others
+                log.warning("Couldn't list %s models: %s", provider, _describe(result))
+                fallback = [m for m in [self.default_model(provider)] if m]
+                self._model_lists[provider] = (now + MODEL_LIST_RETRY, fallback)
+            else:
+                self._model_lists[provider] = (now + MODEL_LIST_TTL, result)
+        return {p: self._model_lists[p][1] for p in providers}
 
     async def _list_gemini(self) -> list[str]:
         headers = {"x-goog-api-key": self.gemini_keys.items[0]}
@@ -214,8 +218,10 @@ class Agent:
     async def _list_claude(self) -> list[str]:
         url = config.CLAUDE_API_URL.rstrip("/") + "/v1/models"
         headers = {"x-api-key": config.CLAUDE_API_KEY} if config.CLAUDE_API_KEY else {}
-        async with self.http.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+        async with self.http.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=2)) as resp:
             data = await resp.json()
+            if resp.status != 200:
+                raise RuntimeError(data.get("error", {}).get("message", f"HTTP {resp.status}"))
         return [m["id"] for m in data.get("data", [])]
 
     async def run(
