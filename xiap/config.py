@@ -47,8 +47,9 @@ CLAUDE_TIMEOUT = int(os.getenv("CLAUDE_TIMEOUT", "300"))  # per request; the CLI
 # before the bot gives up on it and fails over to the next one.
 CHAT_TIMEOUT = int(os.getenv("CHAT_TIMEOUT", "90"))
 
-# Images attached to the pinging message (or the one it replies to) are shown
-# to the model, up to this many, each at most CHAT_IMAGE_MAX_MB.
+# Images on the pinging message, the one it replies to, then the last
+# CHAT_BASE_CONTEXT messages (attached or embedded from a link, like Tenor GIFs)
+# are shown to the model, up to this many, each at most CHAT_IMAGE_MAX_MB.
 CHAT_MAX_IMAGES = int(os.getenv("CHAT_MAX_IMAGES", "4"))
 CHAT_IMAGE_MAX_MB = float(os.getenv("CHAT_IMAGE_MAX_MB", "5"))
 # PDFs go to a model that can read them (Gemini or Claude; Cohere can't, so
