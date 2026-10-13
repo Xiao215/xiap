@@ -32,10 +32,9 @@ COHERE_API_KEYS = _load_keys("COHERE")
 COHERE_MODEL = os.getenv("COHERE_MODEL", "command-a-plus-05-2026")
 
 GEMINI_API_KEYS = _load_keys("GEMINI")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.7-flash")
-# Gemini Pro models have no free-tier quota, so /models hides them unless your
-# key has billing enabled.
-GEMINI_LIST_PRO = os.getenv("GEMINI_LIST_PRO", "").lower() in ("1", "true", "yes")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+# The only Gemini models offered in /models and /model.
+GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash-lite"]
 
 # Claude via the configured claude-api server (https://github.com/Xiao215/claude-api).
 # All users can select it. Empty URL = off; failures fall back to other providers.

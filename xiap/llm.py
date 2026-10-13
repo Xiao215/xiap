@@ -18,7 +18,6 @@ import asyncio
 import base64
 import json
 import logging
-import re
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
@@ -32,10 +31,6 @@ from xiap import config
 log = logging.getLogger(__name__)
 
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-GEMINI_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000"
-# The Gemini catalogue also lists TTS, image, music, robotics… models; keep the
-# chat ones: gemini-<version>-pro/flash/flash-lite, optionally -preview, and the -latest aliases.
-GEMINI_CHAT_RE = re.compile(r"^gemini-(\d[\d.]*-)?(pro|flash|flash-lite)(-preview)?(-latest)?$")
 MODEL_LIST_TTL = 3600  # seconds to cache a provider's model list
 # A failed listing (e.g. the claude-api server isn't up yet) is retried this
 # soon instead of hiding that provider's models for the full hour.
@@ -223,14 +218,7 @@ class Agent:
         return {p: self._model_lists[p][1] for p in providers}
 
     async def _list_gemini(self) -> list[str]:
-        headers = {"x-goog-api-key": self.gemini_keys.items[0]}
-        async with self.http.get(GEMINI_MODELS_URL, headers=headers) as resp:
-            data = await _read_json(resp)
-        names = [m["name"].removeprefix("models/") for m in data.get("models", [])]
-        names = [n for n in names if GEMINI_CHAT_RE.match(n)]
-        if not config.GEMINI_LIST_PRO:
-            names = [n for n in names if "-pro" not in n]
-        return sorted(names, reverse=True)
+        return list(config.GEMINI_MODELS)
 
     async def _list_cohere(self) -> list[str]:
         res = await self.cohere_clients.items[0].models.list(endpoint="chat", page_size=100)
