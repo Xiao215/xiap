@@ -6,7 +6,7 @@ it: older channel history, or a specific message (by id or link) along with
 the reply chain above it. Files on the pinging message (or the one it replies
 to) are shown to the model too: images and PDFs as-is, text files pasted into
 the prompt. Everything it can read still obeys /context and /optout. Provider
-handling (Gemini/Cohere for everyone, Claude for the owner only, key rotation,
+handling (Gemini/Cohere/Claude for everyone, key rotation,
 failover, PDF-capable models first) lives in xiap.llm.
 """
 
@@ -404,12 +404,6 @@ class ChatCog(commands.Cog):
         if self.http:
             await self.http.close()
 
-    async def is_owner(self, user: discord.abc.User) -> bool:
-        """OWNER_ID if set, else whoever owns the bot in the Developer Portal."""
-        if config.OWNER_ID:
-            return user.id == config.OWNER_ID
-        return await self.bot.is_owner(user)
-
     def _system_prompt(self, guild: discord.Guild | None) -> str:
         # str(emoji) yields the exact sendable token: <:name:id> or <a:name:id> for animated.
         emojis = "\n".join(str(e) for e in (guild.emojis if guild else ()))
@@ -438,8 +432,7 @@ class ChatCog(commands.Cog):
         )
         if not (is_reply_to_me or is_mention):
             return
-        owner = self.agent.claude_enabled and await self.is_owner(message.author)
-        if not (self.agent.providers or owner):
+        if not self.agent.providers:
             return
 
         log.info(
@@ -462,14 +455,14 @@ class ChatCog(commands.Cog):
             content += f" [attached: {', '.join(a.filename for a in message.attachments)}]"
 
         try:
-            await self._answer(message, replied, content, owner)
+            await self._answer(message, replied, content)
         except Exception:
             # Otherwise discord.py just logs it and the ping goes unanswered.
             log.exception("Chat reply to %s failed", message.author.display_name)
             with contextlib.suppress(discord.HTTPException):
                 await message.reply("Something broke on my end, try again 😵", allowed_mentions=discord.AllowedMentions.none())
 
-    async def _answer(self, message: discord.Message, replied: discord.Message | None, content: str, owner: bool) -> None:
+    async def _answer(self, message: discord.Message, replied: discord.Message | None, content: str) -> None:
         ctx = ChatContext(self.bot, message)
         # The replied-to message (and its files: "@xiap what's this?" on a photo
         # or a PDF) is only shown if its text would be readable.
@@ -482,7 +475,7 @@ class ChatCog(commands.Cog):
             media, texts, skipped = await _read_attachments(message, replied)
             prompt = await ctx.prompt(replied, content, texts, skipped)
             result = await self.agent.run(
-                self._system_prompt(message.guild), prompt, ctx.tools(), media, owner=owner, pick=pick
+                self._system_prompt(message.guild), prompt, ctx.tools(), media, pick=pick
             )
         if result is None:
             response, tag = "My brain is fried right now, try again in a bit 😵", None
@@ -500,6 +493,6 @@ class ChatCog(commands.Cog):
 
 
 async def setup(bot: XiapBot) -> None:
-    if not (config.GEMINI_API_KEYS or config.COHERE_API_KEYS):
-        log.warning("No Gemini or Cohere API keys configured — AI chat disabled for non-owners")
+    if not (config.GEMINI_API_KEYS or config.COHERE_API_KEYS or config.CLAUDE_API_URL):
+        log.warning("No AI chat providers configured — AI chat disabled")
     await bot.add_cog(ChatCog(bot))

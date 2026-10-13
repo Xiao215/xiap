@@ -24,8 +24,8 @@ def _load_keys(prefix: str) -> list[str]:
     return keys
 
 
-# Chat providers. "auto" prefers Gemini (higher free-tier limits) and falls back
-# to Cohere; set CHAT_PROVIDER=cohere or =gemini to force one as primary.
+# Chat providers, shared by everyone. "auto" tries Claude, Gemini, then Cohere;
+# set CHAT_PROVIDER=gemini, =cohere or =claude to make one primary.
 CHAT_PROVIDER = os.getenv("CHAT_PROVIDER", "auto").lower()
 
 COHERE_API_KEYS = _load_keys("COHERE")
@@ -37,14 +37,8 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.7-flash")
 # key has billing enabled.
 GEMINI_LIST_PRO = os.getenv("GEMINI_LIST_PRO", "").lower() in ("1", "true", "yes")
 
-# Owner-only Claude: the bot owner's messages go to the owner's local
-# claude-api server (https://github.com/Xiao215/claude-api), which runs the
-# `claude` CLI on their own Pro/Max subscription. Nobody else ever reaches it —
-# the plan is for personal use. If the server isn't running (e.g. in Docker)
-# the owner falls back to Gemini/Cohere like everyone else. Empty URL = off.
-# The owner is OWNER_ID (a Discord user id) if set, else whoever owns the bot
-# application in the Developer Portal.
-OWNER_ID = int(os.getenv("OWNER_ID") or 0)
+# Claude via the configured claude-api server (https://github.com/Xiao215/claude-api).
+# All users can select it. Empty URL = off; failures fall back to other providers.
 CLAUDE_API_URL = os.getenv("CLAUDE_API_URL", "http://127.0.0.1:8787")
 CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY", "")  # only if claude-api has API_KEY set
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "")  # haiku | sonnet | opus; empty = server default

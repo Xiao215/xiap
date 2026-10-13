@@ -1,9 +1,9 @@
 """/models and /model — see which AI models can answer you, and pick one.
 
-The pick is per person: it only changes who answers *your* pings. Claude
-models are listed and selectable only for the bot owner, since Claude runs on
-the owner's personal subscription. If your pick is down or rate-limited the
-bot falls back to the default chain and says so under the reply.
+The pick is per person: it only changes who answers *your* pings. Everyone
+can see and select models from every configured provider. If your pick is
+down or rate-limited the bot falls back to the default chain and says so
+under the reply.
 """
 
 import discord
@@ -13,7 +13,7 @@ from discord.ext import commands
 from xiap.llm import Agent
 from xiap.store import store
 
-PROVIDER_NAMES = {"gemini": "Gemini", "cohere": "Cohere", "claude": "Claude (owner only)"}
+PROVIDER_NAMES = {"gemini": "Gemini", "cohere": "Cohere", "claude": "Claude"}
 DEFAULT = "default"
 
 
@@ -26,17 +26,14 @@ class ModelsCog(commands.Cog):
         chat = self.bot.get_cog("ChatCog")
         return chat.agent if chat else None
 
-    async def _choices(self, user: discord.abc.User) -> dict[str, list[str]] | None:
-        """Models this user may pick, by provider; None if AI chat isn't set up."""
+    async def _choices(self) -> dict[str, list[str]] | None:
+        """Shared model choices by provider; None if AI chat isn't set up."""
         if self._agent is None:
             return None
-        lists = await self._agent.list_models()
-        if "claude" in lists and not await self.bot.get_cog("ChatCog").is_owner(user):
-            del lists["claude"]
-        return lists
+        return await self._agent.list_models()
 
-    def _default_label(self, owner: bool) -> str:
-        chain = self._agent.chain(owner=owner)
+    def _default_label(self) -> str:
+        chain = self._agent.chain()
         if not chain:
             return "nothing configured"
         provider, model = chain[0]
@@ -45,19 +42,19 @@ class ModelsCog(commands.Cog):
     @app_commands.command(name="models", description="List the AI models that can answer you, and which one you're using")
     async def models(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True)
-        lists = await self._choices(interaction.user)
+        lists = await self._choices()
         if not lists:
             await interaction.followup.send("AI chat isn't set up on this bot.", ephemeral=True)
             return
-        owner = "claude" in lists
         pick = store.get_model_pick(interaction.user.id)
         embed = discord.Embed(
             title="🤖 AI models",
             color=discord.Color.blurple(),
             description=(
-                f"**You're using:** `{pick or self._default_label(owner)}`"
+                f"**You're using:** `{pick or self._default_label()}`"
                 + ("" if pick else " (default)")
                 + "\nSwitch with `/model`, or `/model default` to go back. Only affects replies to you."
+                + "\nType a model name in `/model` to search beyond the first 25 suggestions."
             ),
         )
         for provider, names in lists.items():
@@ -75,14 +72,14 @@ class ModelsCog(commands.Cog):
     @app_commands.describe(model="A model from /models, or 'default'")
     async def model(self, interaction: discord.Interaction, model: str) -> None:
         await interaction.response.defer(ephemeral=True)
-        lists = await self._choices(interaction.user)
+        lists = await self._choices()
         if not lists:
             await interaction.followup.send("AI chat isn't set up on this bot.", ephemeral=True)
             return
         model = model.strip()
         if model.lower() == DEFAULT:
             store.set_model_pick(interaction.user.id, None)
-            label = self._default_label("claude" in lists)
+            label = self._default_label()
             await interaction.followup.send(f"🔄 Back to the default: `{label}`.", ephemeral=True)
             return
 
@@ -104,7 +101,7 @@ class ModelsCog(commands.Cog):
     async def _model_autocomplete(
         self, interaction: discord.Interaction, current: str
     ) -> list[app_commands.Choice[str]]:
-        lists = await self._choices(interaction.user) or {}
+        lists = await self._choices() or {}
         options = [DEFAULT] + [f"{p}:{n}" for p, names in lists.items() for n in names]
         current = current.lower()
         return [app_commands.Choice(name=o, value=o) for o in options if current in o.lower()][:25]

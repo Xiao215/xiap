@@ -1,4 +1,4 @@
-"""Tool-calling agent loop over Gemini, Cohere and (owner only) Claude.
+"""Tool-calling agent loop over Gemini, Cohere and Claude.
 
 The model gets a system prompt, the user's message (plus any images and PDFs)
 and a set of tools. Each round it either answers or asks for tools; we run
@@ -7,12 +7,11 @@ rounds, at which point tools are switched off so it has to answer with what it
 has).
 
 Gemini and Cohere round-robin across their configured API keys. Claude goes
-through the owner's local claude-api server (Anthropic Messages format) and is
-only ever used for the owner's own messages — a Pro/Max plan is for personal
-use. Cohere can't read PDFs, so when one is attached the providers that can go
-first. If a provider fails outright, or takes longer than its deadline, the
-whole run restarts on the next. Tools are read-only, so re-running them on
-failover is harmless.
+through the configured claude-api server (Anthropic Messages format). All
+configured providers are available to everyone. Cohere can't read PDFs, so
+when one is attached, providers that can read it go first. If a provider fails
+outright, or takes longer than its deadline, the whole run restarts on the
+next. Tools are read-only, so re-running them on failover is harmless.
 """
 
 import asyncio
@@ -41,6 +40,8 @@ MODEL_LIST_TTL = 3600  # seconds to cache a provider's model list
 # A failed listing (e.g. the claude-api server isn't up yet) is retried this
 # soon instead of hiding that provider's models for the full hour.
 MODEL_LIST_RETRY = 60
+# Leave room to send Discord's autocomplete response within its 3s deadline.
+MODEL_LIST_TIMEOUT = 2
 
 # Tool results are truncated to this many characters so one call can't blow up the prompt.
 MAX_TOOL_RESULT_CHARS = 6000
@@ -157,9 +158,8 @@ class Agent:
 
         self.claude_enabled = bool(config.CLAUDE_API_URL)
 
-        # Providers for everyone, primary first and the other as fallback.
-        # Claude isn't one of them: it's only put in front for the owner.
-        available = [p for p in ("gemini", "cohere") if self.configured(p)]  # "auto" prefers Gemini
+        # Shared default order; a person's /model pick takes priority.
+        available = [p for p in ("claude", "gemini", "cohere") if self.configured(p)]  # "auto" prefers Claude
         if config.CHAT_PROVIDER in available:
             available.remove(config.CHAT_PROVIDER)
             available.insert(0, config.CHAT_PROVIDER)
@@ -178,18 +178,15 @@ class Agent:
     def default_model(provider: str) -> str:
         return {"gemini": config.GEMINI_MODEL, "cohere": config.COHERE_MODEL, "claude": config.CLAUDE_MODEL}[provider]
 
-    def chain(self, owner: bool = False, pick: str | None = None, pdf: bool = False) -> list[tuple[str, str]]:
+    def chain(self, pick: str | None = None, pdf: bool = False) -> list[tuple[str, str]]:
         """(provider, model) pairs to try in order: the user's pick first (if
-        any), then Claude for the owner, then the default providers. With a PDF
-        attached, the ones that can read it move to the front; the rest stay as
-        a last resort."""
+        any), then the default providers. With a PDF attached, the ones that
+        can read it move to the front; the rest stay as a last resort."""
         chain = []
         if pick:
             provider, _, model = pick.partition(":")
-            if self.configured(provider) and (provider != "claude" or owner):
+            if self.configured(provider):
                 chain.append((provider, model))
-        if owner and self.claude_enabled:
-            chain.append(("claude", config.CLAUDE_MODEL))
         chain += [(name, self.default_model(name)) for name in self.providers]
         chain = list(dict.fromkeys(chain))  # dedupe, keep order
         if pdf:  # stable sort: PDF readers first, order otherwise kept
@@ -199,19 +196,27 @@ class Agent:
     async def list_models(self) -> dict[str, list[str]]:
         """Chat models each configured provider offers, each cached for an hour
         (a failed listing only for a minute, so it's retried soon).
-        Includes Claude when configured — callers must only show it to the owner."""
-        # Claude first: it's the owner's default, and in /model's autocomplete
-        # it would otherwise sit below a dozen Gemini models, out of view.
+        Keep the last known list during outages; all users see the same models."""
+        # Claude first so it isn't buried beneath a long Gemini catalogue.
         fetchers = {"claude": self._list_claude, "gemini": self._list_gemini, "cohere": self._list_cohere}
         providers = [p for p in fetchers if self.configured(p)]
         now = time.monotonic()
         stale = [p for p in providers if self._model_lists.get(p, (0.0, []))[0] <= now]
         # Fetch in parallel: /model autocomplete must answer Discord within 3s.
-        results = await asyncio.gather(*(fetchers[p]() for p in stale), return_exceptions=True)
+        results = await asyncio.gather(
+            *(asyncio.wait_for(fetchers[p](), timeout=MODEL_LIST_TIMEOUT) for p in stale),
+            return_exceptions=True,
+        )
         for provider, result in zip(stale, results, strict=True):
-            if isinstance(result, BaseException):  # a provider being down shouldn't hide the others
-                log.warning("Couldn't list %s models: %s", provider, _describe(result))
-                fallback = [m for m in [self.default_model(provider)] if m]
+            if isinstance(result, BaseException) or not result:
+                reason = _describe(result) if isinstance(result, BaseException) else "empty model list"
+                log.warning("Couldn't list %s models: %s", provider, reason)
+                fallback = self._model_lists.get(provider, (0.0, []))[1]
+                if not fallback:
+                    fallback = [m for m in [self.default_model(provider)] if m]
+                    if provider == "claude":
+                        # claude-api accepts these aliases even before discovery succeeds.
+                        fallback = list(dict.fromkeys(fallback + ["sonnet", "opus", "haiku"]))
                 self._model_lists[provider] = (now + MODEL_LIST_RETRY, fallback)
             else:
                 self._model_lists[provider] = (now + MODEL_LIST_TTL, result)
@@ -232,8 +237,7 @@ class Agent:
         return sorted((m.name for m in res.models or [] if m.name), reverse=True)
 
     async def _list_claude(self) -> list[str]:
-        timeout = aiohttp.ClientTimeout(total=2)
-        async with self.http.get(_claude_url("models"), headers=_claude_headers(), timeout=timeout) as resp:
+        async with self.http.get(_claude_url("models"), headers=_claude_headers()) as resp:
             data = await _read_json(resp)
         return [m["id"] for m in data.get("data", [])]
 
@@ -243,7 +247,6 @@ class Agent:
         prompt: str,
         tools: list[Tool],
         attachments: Sequence[Attachment] = (),
-        owner: bool = False,
         pick: str | None = None,
     ) -> tuple[str, str, str] | None:
         """Run the agent loop; returns (answer, "provider:model" from the chain,
@@ -251,7 +254,7 @@ class Agent:
         `pick` is the user's chosen "provider:model"."""
         by_name = {t.name: t for t in tools}
         pdf = any(a.mime == PDF for a in attachments)
-        for provider, model in self.chain(owner, pick, pdf):
+        for provider, model in self.chain(pick=pick, pdf=pdf):
             label = f"{provider}:{model}" if model else provider
             # A slow model (thinking, preview, a stuck connection) shouldn't
             # leave the chat staring at "typing…" — give up and fail over.
@@ -384,7 +387,7 @@ class Agent:
                 messages.append({"role": "tool", "tool_call_id": call.id, "content": json.dumps({"result": result})})
         raise RuntimeError("no answer after tool rounds")
 
-    # --- Claude (owner only, via the local claude-api server) -----------------
+    # --- Claude (via the configured claude-api server) -----------------------
 
     async def _claude_request(self, body: dict) -> dict:
         # Each round runs the `claude` CLI, which can take a while (and longer
@@ -439,4 +442,3 @@ class Agent:
                 results.append({"type": "tool_result", "tool_use_id": call["id"], "content": result})
             messages.append({"role": "user", "content": results})
         raise RuntimeError("no answer after tool rounds")
-
