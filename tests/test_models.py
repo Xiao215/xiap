@@ -14,17 +14,17 @@ class ModelTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         settings = patch.multiple(
             config,
-            GEMINI_API_KEYS=["test-key"],
             COHERE_API_KEYS=[],
             CLI_BRIDGE_URL="http://localhost:8787",
             CLAUDE_MODEL="",
+            GEMINI_MODEL="",
             CHAT_PROVIDER="auto",
         )
         settings.start()
         self.addCleanup(settings.stop)
         self.agent = Agent(Mock())
         self.agent._list_claude = AsyncMock(return_value=["sonnet", "opus", "haiku"])
-        self.agent._list_gemini = AsyncMock(return_value=[config.GEMINI_MODEL])
+        self.agent._list_gemini = AsyncMock(return_value=["gemini-3.8-flash-high"])
         self.chat = SimpleNamespace(agent=self.agent, is_owner=AsyncMock(return_value=False))
         self.bot = Mock()
         self.bot.get_cog.return_value = self.chat
@@ -55,7 +55,7 @@ class ModelTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_non_owner_claude_pick_is_used_to_answer(self):
         claude = AsyncMock(return_value=("Hello", "claude-sonnet"))
-        gemini = AsyncMock(return_value=("Fallback", config.GEMINI_MODEL))
+        gemini = AsyncMock(return_value=("Fallback", "gemini-3.8-flash-high"))
         self.agent._runners.update(claude=claude, gemini=gemini)
         result = await self.agent.run("system", "prompt", [], pick="claude:sonnet")
         self.assertEqual(result, ("Hello", "claude:sonnet", "claude-sonnet"))
@@ -63,10 +63,10 @@ class ModelTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_claude_failure_falls_back_to_gemini(self):
         claude = AsyncMock(side_effect=RuntimeError("unavailable"))
-        gemini = AsyncMock(return_value=("Fallback", config.GEMINI_MODEL))
+        gemini = AsyncMock(return_value=("Fallback", "gemini-3.8-flash-high"))
         self.agent._runners.update(claude=claude, gemini=gemini)
         result = await self.agent.run("system", "prompt", [])
-        self.assertEqual(result[1], f"gemini:{config.GEMINI_MODEL}")
+        self.assertEqual(result[1], "gemini")
         claude.assert_awaited()
         gemini.assert_awaited_once()
 
@@ -80,12 +80,12 @@ class ModelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.cog._default_label(), "claude (server default)")
 
     async def test_gemini_remains_selectable_and_overrides_default(self):
-        pick = f"gemini:{config.GEMINI_MODEL}"
+        pick = "gemini:gemini-3.8-flash-high"
         with patch("xiap.cogs.models.store") as store:
             await self.cog.model.callback(self.cog, self.interaction, pick)
         store.set_model_pick.assert_called_once_with(42, pick)
         claude = AsyncMock()
-        gemini = AsyncMock(return_value=("Hello", config.GEMINI_MODEL))
+        gemini = AsyncMock(return_value=("Hello", "gemini-3.8-flash-high"))
         self.agent._runners.update(claude=claude, gemini=gemini)
         result = await self.agent.run("system", "prompt", [], pick=pick)
         self.assertEqual(result[1], pick)
@@ -97,9 +97,8 @@ class ModelTests(unittest.IsolatedAsyncioTestCase):
         store.set_model_pick.assert_called_once_with(42, None)
         self.assertIn("claude", self.interaction.followup.send.call_args.args[0])
 
-    async def test_claude_only_setup_answers_non_owner(self):
-        with patch.multiple(config, GEMINI_API_KEYS=[], COHERE_API_KEYS=[]):
-            agent = Agent(Mock())
+    async def test_bridge_only_setup_answers_non_owner(self):
+        agent = Agent(Mock())
         bot = Mock(user=SimpleNamespace(id=99, display_name="xiap"))
         chat = ChatCog(bot)
         chat.agent = agent
@@ -152,21 +151,26 @@ class ModelTests(unittest.IsolatedAsyncioTestCase):
         choices = await self.cog._model_autocomplete(self.interaction, "gemini-test-29")
         self.assertEqual([c.value for c in choices], ["gemini:gemini-test-29"])
 
-    async def test_disabled_claude_is_not_listed_or_used(self):
-        with patch.object(config, "CLI_BRIDGE_URL", ""):
+    async def test_disabled_bridge_is_not_listed_or_used(self):
+        with patch.multiple(config, CLI_BRIDGE_URL="", COHERE_API_KEYS=["test-key"]):
             agent = Agent(Mock())
-        agent._list_gemini = self.agent._list_gemini
-        self.assertNotIn("claude", await agent.list_models())
-        self.assertNotIn("claude", [p for p, _ in agent.chain(pick="claude:sonnet")])
-        self.assertEqual(agent.chain()[0][0], "gemini")
+        agent._list_cohere = AsyncMock(return_value=["command-test"])
+        self.assertEqual(list(await agent.list_models()), ["cohere"])
+        self.assertEqual([p for p, _ in agent.chain(pick="claude:sonnet")], ["cohere"])
 
-    async def test_bridge_gemini_models_are_not_listed_as_claude(self):
+    async def test_bridge_models_split_into_claude_and_gemini(self):
         agent = Agent(MagicMock())
         resp = AsyncMock()
         resp.status = 200
-        resp.json.return_value = {"data": [{"id": "sonnet"}, {"id": "gemini-3.8-flash-high"}, {"id": "gemini"}]}
+        resp.json.return_value = {"data": [{"id": "sonnet"}, {"id": "gemini-3.8-flash-high"}, {"id": "opus"}]}
         agent.http.get.return_value.__aenter__.return_value = resp
-        self.assertEqual(await agent._list_claude(), ["sonnet"])
+        self.assertEqual(await agent.list_models(), {"claude": ["sonnet", "opus"], "gemini": ["gemini-3.8-flash-high"]})
+
+    async def test_gemini_without_a_model_asks_the_bridge_for_gemini(self):
+        self.agent._bridge_request = AsyncMock(return_value={"content": [{"type": "text", "text": "Hi"}], "model": "gemini-3.8-flash-high"})
+        result = await self.agent.run("system", "prompt", [], pick="gemini:")
+        self.assertEqual(result, ("Hi", "gemini", "gemini-3.8-flash-high"))
+        self.assertEqual(self.agent._bridge_request.call_args.args[0]["model"], "gemini")
 
     def test_shared_primary_can_be_configured_as_claude(self):
         with patch.object(config, "CHAT_PROVIDER", "claude"):

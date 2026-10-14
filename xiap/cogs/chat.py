@@ -8,7 +8,7 @@ to) are shown to the model too: images and PDFs as-is, text files pasted into
 the prompt. Images in the recent messages are shown as well, and so are images
 Discord embedded from links (pasted image links, Tenor/Giphy GIFs). Everything
 it can read still obeys /context and /optout. Provider
-handling (Gemini/Cohere/Claude for everyone, key rotation,
+handling (Claude/Gemini/Cohere for everyone, key rotation,
 failover, PDF-capable models first) lives in xiap.llm.
 """
 
@@ -47,7 +47,7 @@ EMBED_WAIT = 2
 
 MB = 1024 * 1024
 # Images and PDFs in one ping together stay under this, so the request stays
-# under Gemini's and the cli-bridge server's 20 MB limit once base64'd.
+# under the cli-bridge server's 20 MB limit once base64'd.
 MAX_INLINE_BYTES = 14 * MB
 # Text files bigger than this aren't downloaded just to be cut off.
 MAX_TEXT_BYTES = 1 * MB
@@ -654,6 +654,6 @@ class ChatCog(commands.Cog):
 
 
 async def setup(bot: XiapBot) -> None:
-    if not (config.GEMINI_API_KEYS or config.COHERE_API_KEYS or config.CLI_BRIDGE_URL):
+    if not (config.CLI_BRIDGE_URL or config.COHERE_API_KEYS):
         log.warning("No AI chat providers configured — AI chat disabled")
     await bot.add_cog(ChatCog(bot))

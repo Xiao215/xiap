@@ -1,12 +1,12 @@
 # xiap 🤖
 
-A friendly AI Discord bot for the Sunday Social group chat. Mention it (or reply to it) and it chats back using Gemini or Cohere, complete with your server's custom emojis — plus a bag of party tricks for the group.
+A friendly AI Discord bot for the Sunday Social group chat. Mention it (or reply to it) and it chats back using Claude, Gemini or Cohere, complete with your server's custom emojis — plus a bag of party tricks for the group.
 
 ## Features
 
-**AI chat** — @mention the bot or reply to one of its messages and it responds in character with your server's custom emojis. It sees the last few messages up front and pulls more context itself when it needs it — older channel history, a linked message, or a long reply chain — within the limits set by `/context` and `/optout`. Attach a file (or reply to a message with one) and it reads it: images and PDFs directly, and text files (`.txt`, `.md`, `.csv`, code…) pasted into the prompt. It also sees images in the last few messages, including pasted image links and Tenor/Giphy GIFs (via Discord's embeds); animated GIFs are shown as a grid of frames. Cohere can't read PDFs, so a PDF goes to a model that can, even if you picked a Cohere model with `/model`; the tag under the reply says when that happened. Powered by Gemini Flash (free tier) and/or Cohere — configure either or both; keys round-robin and providers fail over automatically.
+**AI chat** — @mention the bot or reply to one of its messages and it responds in character with your server's custom emojis. It sees the last few messages up front and pulls more context itself when it needs it — older channel history, a linked message, or a long reply chain — within the limits set by `/context` and `/optout`. Attach a file (or reply to a message with one) and it reads it: images and PDFs directly, and text files (`.txt`, `.md`, `.csv`, code…) pasted into the prompt. It also sees images in the last few messages, including pasted image links and Tenor/Giphy GIFs (via Discord's embeds); animated GIFs are shown as a grid of frames. Cohere can't read PDFs, so a PDF goes to a model that can, even if you picked a Cohere model with `/model`; the tag under the reply says when that happened. Powered by Claude and Gemini through [cli-bridge](https://github.com/Xiao215/cli-bridge) and/or Cohere — configure either or both; Cohere keys round-robin and providers fail over automatically.
 
-**Claude for everyone** — every user can see and select Claude models from the configured [cli-bridge](https://github.com/Xiao215/cli-bridge) server, with the same context tools and image/PDF support. All users share the same provider access; model picks remain personal. `CHAT_PROVIDER=auto` defaults to Claude when configured, then falls back to Gemini and Cohere. Gemini remains selectable through `/model`, and a personal model pick takes priority over the default. If a provider is down or rate-limited, the bot tries the next one. Temporary model-list failures keep the last known options (or Claude's `sonnet`/`opus`/`haiku` aliases on first startup) and retry after a minute. `OWNER_ID` is no longer used.
+**Claude and Gemini for everyone** — every user can see and select the Claude and Gemini models the configured [cli-bridge](https://github.com/Xiao215/cli-bridge) server offers (Gemini needs the Antigravity CLI set up next to it), with the same context tools and image/PDF support. All users share the same provider access; model picks remain personal. `CHAT_PROVIDER=auto` defaults to Claude when configured, then falls back to Gemini and Cohere. A personal model pick takes priority over the default. If a provider is down or rate-limited, the bot tries the next one. Temporary model-list failures keep the last known options (or Claude's `sonnet`/`opus`/`haiku` aliases on first startup) and retry after a minute. `OWNER_ID` is no longer used.
 
 **Slash commands**
 
@@ -25,11 +25,11 @@ A friendly AI Discord bot for the Sunday Social group chat. Mention it (or reply
 ## Setup
 
 1. Create a bot at the [Discord Developer Portal](https://discord.com/developers/applications). Under **Bot**, enable the **Message Content Intent** and copy the token.
-2. Get a free Gemini API key from [Google AI Studio](https://aistudio.google.com/apikey) and/or Cohere keys from the [Cohere dashboard](https://dashboard.cohere.com/api-keys).
+2. Run [cli-bridge](https://github.com/Xiao215/cli-bridge) for Claude (and Gemini, with the Antigravity CLI), and/or get Cohere keys from the [Cohere dashboard](https://dashboard.cohere.com/api-keys).
 3. Configure and run:
 
 ```bash
-cp .env.example .env   # fill in DISCORD_TOKEN and GEMINI_API_KEYS and/or COHERE_API_KEYS
+cp .env.example .env   # fill in DISCORD_TOKEN, plus CLI_BRIDGE_URL and/or COHERE_API_KEYS
 pip install -r requirements.txt
 python app.py
 ```
@@ -61,7 +61,7 @@ xiap/
   bot.py               XiapBot, cog loading, slash-command sync
   config.py            env/config
   store.py             JSON-file settings store (data.json)
-  llm.py               tool-calling agent loop over Gemini/Cohere/Claude
+  llm.py               tool-calling agent loop over Claude/Gemini/Cohere
   discord_md.py        fixes model markdown for Discord (tables, rules), fence-safe splitting
   web.py               aiohttp health-check server
   cogs/

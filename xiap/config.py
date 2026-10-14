@@ -25,25 +25,23 @@ def _load_keys(prefix: str) -> list[str]:
 
 
 # Chat providers, shared by everyone. "auto" tries Claude, Gemini, then Cohere;
-# set CHAT_PROVIDER=gemini, =cohere or =claude to make one primary.
+# set CHAT_PROVIDER=claude, =gemini or =cohere to make one primary.
 CHAT_PROVIDER = os.getenv("CHAT_PROVIDER", "auto").lower()
 
 COHERE_API_KEYS = _load_keys("COHERE")
 COHERE_MODEL = os.getenv("COHERE_MODEL", "command-a-plus-05-2026")
 
-GEMINI_API_KEYS = _load_keys("GEMINI")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
-# The only Gemini models offered in /models and /model.
-GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash-lite"]
-
-# Claude via the configured cli-bridge server (https://github.com/Xiao215/cli-bridge).
-# All users can select it. Empty URL = off; failures fall back to other providers.
+# Claude and Gemini via the configured cli-bridge server
+# (https://github.com/Xiao215/cli-bridge), which runs the `claude` CLI and, for
+# gemini-* models, the Antigravity CLI (`agy`). All users can select them.
+# Empty URL = off; failures fall back to other providers.
 CLI_BRIDGE_URL = os.getenv("CLI_BRIDGE_URL", "http://127.0.0.1:8787")
 CLI_BRIDGE_KEY = os.getenv("CLI_BRIDGE_KEY", "")  # only if cli-bridge has API_KEY set
+CLI_BRIDGE_TIMEOUT = int(os.getenv("CLI_BRIDGE_TIMEOUT", "300"))  # per request; the CLIs can be slow
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "")  # haiku | sonnet | opus; empty = server default
-CLAUDE_TIMEOUT = int(os.getenv("CLAUDE_TIMEOUT", "300"))  # per request; the CLI can be slow
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "")  # e.g. gemini-3.8-flash-high; empty = agy picks
 
-# Seconds a Gemini/Cohere model gets to answer (all tool rounds included)
+# Seconds a Cohere model gets to answer (all tool rounds included)
 # before the bot gives up on it and fails over to the next one.
 CHAT_TIMEOUT = int(os.getenv("CHAT_TIMEOUT", "90"))
 
@@ -52,10 +50,10 @@ CHAT_TIMEOUT = int(os.getenv("CHAT_TIMEOUT", "90"))
 # are shown to the model, up to this many, each at most CHAT_IMAGE_MAX_MB.
 CHAT_MAX_IMAGES = int(os.getenv("CHAT_MAX_IMAGES", "4"))
 CHAT_IMAGE_MAX_MB = float(os.getenv("CHAT_IMAGE_MAX_MB", "5"))
-# PDFs go to a model that can read them (Gemini or Claude; Cohere can't, so
+# PDFs go to a model that can read them (Claude or Gemini; Cohere can't, so
 # it's skipped while one can answer). Up to CHAT_MAX_PDFS, each at most
 # CHAT_PDF_MAX_MB. All images and PDFs in one ping together stay under ~14 MB,
-# since Gemini and the cli-bridge server cap a request at 20 MB once base64'd.
+# since the cli-bridge server caps a request at 20 MB once base64'd.
 CHAT_MAX_PDFS = int(os.getenv("CHAT_MAX_PDFS", "2"))
 CHAT_PDF_MAX_MB = float(os.getenv("CHAT_PDF_MAX_MB", "10"))
 # Text files (.txt, .md, .csv, code…) are pasted into the prompt for every

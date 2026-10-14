@@ -1,4 +1,4 @@
-"""Tool-calling agent loop over Gemini, Cohere and Claude.
+"""Tool-calling agent loop over Claude, Gemini and Cohere.
 
 The model gets a system prompt, the user's message (plus any images and PDFs)
 and a set of tools. Each round it either answers or asks for tools; we run
@@ -6,9 +6,10 @@ them, hand back the results and repeat until it answers (or runs out of
 rounds, at which point tools are switched off so it has to answer with what it
 has).
 
-Gemini and Cohere round-robin across their configured API keys. Claude goes
-through the configured cli-bridge server (Anthropic Messages format). All
-configured providers are available to everyone. Cohere can't read PDFs, so
+Claude and Gemini both go through the configured cli-bridge server (Anthropic
+Messages format), which runs them on the `claude` and `agy` CLIs. Cohere
+round-robins across its configured API keys. All configured providers are
+available to everyone. Cohere can't read PDFs, so
 when one is attached, providers that can read it go first. If a provider fails
 outright, or takes longer than its deadline, the whole run restarts on the
 next. Tools are read-only, so re-running them on failover is harmless.
@@ -16,6 +17,7 @@ next. Tools are read-only, so re-running them on failover is harmless.
 
 import asyncio
 import base64
+import functools
 import json
 import logging
 import time
@@ -30,7 +32,6 @@ from xiap import config
 
 log = logging.getLogger(__name__)
 
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 MODEL_LIST_TTL = 3600  # seconds to cache a provider's model list
 # A failed listing (e.g. the cli-bridge server isn't up yet) is retried this
 # soon instead of hiding that provider's models for the full hour.
@@ -42,10 +43,10 @@ MODEL_LIST_TIMEOUT = 2
 MAX_TOOL_RESULT_CHARS = 6000
 
 PDF = "application/pdf"
-GEMINI_TYPES = {"image/png", "image/jpeg", "image/webp", "image/heic", "image/heif", PDF}
-CLAUDE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp", PDF}
-# Providers that read PDFs (every Gemini chat model does, and Claude does).
-PDF_PROVIDERS = {"gemini", "claude"}
+BRIDGE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp", PDF}
+# Providers served by cli-bridge; they all read images and PDFs.
+BRIDGE_PROVIDERS = {"claude", "gemini"}
+PDF_PROVIDERS = BRIDGE_PROVIDERS
 
 
 @dataclass
@@ -86,11 +87,11 @@ async def _read_json(resp: aiohttp.ClientResponse) -> dict:
     return data
 
 
-def _claude_url(endpoint: str) -> str:
+def _bridge_url(endpoint: str) -> str:
     return f"{config.CLI_BRIDGE_URL.rstrip('/')}/v1/{endpoint}"
 
 
-def _claude_headers() -> dict[str, str]:
+def _bridge_headers() -> dict[str, str]:
     headers = {"anthropic-version": "2023-06-01"}
     if config.CLI_BRIDGE_KEY:
         headers["x-api-key"] = config.CLI_BRIDGE_KEY
@@ -144,14 +145,13 @@ async def _run_tool(tools: dict[str, Tool], name: str, args: dict) -> str:
 class Agent:
     def __init__(self, http: aiohttp.ClientSession) -> None:
         self.http = http
-        self.gemini_keys = KeyRing(config.GEMINI_API_KEYS) if config.GEMINI_API_KEYS else None
         self.cohere_clients = (
             KeyRing([cohere.AsyncClientV2(api_key=k, timeout=60) for k in config.COHERE_API_KEYS])
             if config.COHERE_API_KEYS
             else None
         )
 
-        self.claude_enabled = bool(config.CLI_BRIDGE_URL)
+        self.bridge_enabled = bool(config.CLI_BRIDGE_URL)
 
         # Shared default order; a person's /model pick takes priority.
         available = [p for p in ("claude", "gemini", "cohere") if self.configured(p)]  # "auto" prefers Claude
@@ -160,18 +160,23 @@ class Agent:
             available.insert(0, config.CHAT_PROVIDER)
         self.providers: list[str] = available
         log.info("Chat providers (in order): %s", self.providers or "NONE")
-        self._runners = {"gemini": self._run_gemini, "cohere": self._run_cohere, "claude": self._run_claude}
+        self._runners = {
+            "claude": self._run_bridge,
+            # cli-bridge sends any "gemini*" name to agy; plain "gemini" lets agy pick.
+            "gemini": functools.partial(self._run_bridge, default="gemini"),
+            "cohere": self._run_cohere,
+        }
         # provider -> (monotonic time it expires, models)
         self._model_lists: dict[str, tuple[float, list[str]]] = {}
 
     def configured(self, provider: str) -> bool:
         return bool(
-            {"gemini": self.gemini_keys, "cohere": self.cohere_clients, "claude": self.claude_enabled}.get(provider)
+            {"claude": self.bridge_enabled, "gemini": self.bridge_enabled, "cohere": self.cohere_clients}.get(provider)
         )
 
     @staticmethod
     def default_model(provider: str) -> str:
-        return {"gemini": config.GEMINI_MODEL, "cohere": config.COHERE_MODEL, "claude": config.CLAUDE_MODEL}[provider]
+        return {"claude": config.CLAUDE_MODEL, "gemini": config.GEMINI_MODEL, "cohere": config.COHERE_MODEL}[provider]
 
     def chain(self, pick: str | None = None, pdf: bool = False) -> list[tuple[str, str]]:
         """(provider, model) pairs to try in order: the user's pick first (if
@@ -217,19 +222,21 @@ class Agent:
                 self._model_lists[provider] = (now + MODEL_LIST_TTL, result)
         return {p: self._model_lists[p][1] for p in providers}
 
-    async def _list_gemini(self) -> list[str]:
-        return list(config.GEMINI_MODELS)
-
     async def _list_cohere(self) -> list[str]:
         res = await self.cohere_clients.items[0].models.list(endpoint="chat", page_size=100)
         return sorted((m.name for m in res.models or [] if m.name), reverse=True)
 
-    async def _list_claude(self) -> list[str]:
-        async with self.http.get(_claude_url("models"), headers=_claude_headers()) as resp:
+    async def _list_bridge(self) -> list[str]:
+        async with self.http.get(_bridge_url("models"), headers=_bridge_headers()) as resp:
             data = await _read_json(resp)
-        # cli-bridge also serves gemini-* models (via the Antigravity CLI);
-        # Gemini is offered through its own API, so list only Claude here.
-        return [m["id"] for m in data.get("data", []) if not m["id"].startswith("gemini")]
+        return [m["id"] for m in data.get("data", [])]
+
+    async def _list_claude(self) -> list[str]:
+        return [m for m in await self._list_bridge() if not m.startswith("gemini")]
+
+    async def _list_gemini(self) -> list[str]:
+        # Only there when agy (the Antigravity CLI) is set up next to cli-bridge.
+        return [m for m in await self._list_bridge() if m.startswith("gemini")]
 
     async def run(
         self,
@@ -248,7 +255,7 @@ class Agent:
             label = f"{provider}:{model}" if model else provider
             # A slow model (thinking, preview, a stuck connection) shouldn't
             # leave the chat staring at "typing…" — give up and fail over.
-            deadline = config.CLAUDE_TIMEOUT if provider == "claude" else config.CHAT_TIMEOUT
+            deadline = config.CLI_BRIDGE_TIMEOUT if provider in BRIDGE_PROVIDERS else config.CHAT_TIMEOUT
             started = time.monotonic()
             try:
                 async with asyncio.timeout(deadline):
@@ -258,66 +265,6 @@ class Agent:
             except Exception as e:  # noqa: BLE001 — fall through to the next provider
                 log.error("%s failed after %.1fs: %s", label, time.monotonic() - started, _describe(e))
         return None
-
-    # --- Gemini ---------------------------------------------------------------
-
-    async def _gemini_request(self, payload: dict, model: str) -> dict:
-        url = GEMINI_URL.format(model=model)
-        last_error: Exception | None = None
-        for key in self.gemini_keys.rotation():
-            try:
-                async with self.http.post(url, headers={"x-goog-api-key": key}, json=payload) as resp:
-                    data = await _read_json(resp)
-                return data["candidates"][0]["content"]
-            except Exception as e:  # noqa: BLE001 — rotate to the next key on any API failure
-                last_error = e
-                log.warning("Gemini request failed, rotating key: %s", _describe(e))
-        raise RuntimeError(f"all Gemini keys failed: {last_error}")
-
-    async def _run_gemini(
-        self, system: str, prompt: str, tools: dict[str, Tool], attachments: list[Attachment], model: str
-    ) -> tuple[str, str]:
-        user_parts = [
-            {"inline_data": {"mime_type": a.mime, "data": a.b64()}}
-            for a in attachments
-            if a.mime in GEMINI_TYPES
-        ]
-        user_parts.append({"text": prompt + _attachment_note(attachments, GEMINI_TYPES)})
-        contents: list[dict] = [{"role": "user", "parts": user_parts}]
-        declarations = [
-            {"name": t.name, "description": t.description, "parameters": t.parameters}
-            for t in tools.values()
-        ]
-        for round_ in range(config.CHAT_MAX_TOOL_ROUNDS + 1):
-            payload: dict[str, Any] = {
-                "system_instruction": {"parts": [{"text": system}]},
-                "contents": contents,
-            }
-            if declarations:
-                payload["tools"] = [{"functionDeclarations": declarations}]
-                if round_ == config.CHAT_MAX_TOOL_ROUNDS:  # out of rounds: answer now
-                    payload["toolConfig"] = {"functionCallingConfig": {"mode": "NONE"}}
-            content = await self._gemini_request(payload, model)
-            parts = content.get("parts", [])
-            calls = [p["functionCall"] for p in parts if "functionCall" in p]
-            if not calls:
-                text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
-                if not text.strip():
-                    raise RuntimeError("empty response")
-                return text, model
-
-            # Echo the model turn back verbatim: it carries thought signatures
-            # that Gemini requires to continue a function-calling conversation.
-            contents.append(content)
-            responses = []
-            for call in calls:
-                result = await _run_tool(tools, call["name"], call.get("args") or {})
-                response = {"name": call["name"], "response": {"result": result}}
-                if "id" in call:
-                    response["id"] = call["id"]
-                responses.append({"functionResponse": response})
-            contents.append({"role": "user", "parts": responses})
-        raise RuntimeError("no answer after tool rounds")
 
     # --- Cohere ---------------------------------------------------------------
 
@@ -377,20 +324,28 @@ class Agent:
                 messages.append({"role": "tool", "tool_call_id": call.id, "content": json.dumps({"result": result})})
         raise RuntimeError("no answer after tool rounds")
 
-    # --- Claude (via the configured cli-bridge server) -----------------------
+    # --- Claude and Gemini (via the configured cli-bridge server) -------------
 
-    async def _claude_request(self, body: dict) -> dict:
-        # Each round runs the `claude` CLI, which can take a while (and longer
-        # with web search), so allow more than the shared session's default.
-        timeout = aiohttp.ClientTimeout(total=config.CLAUDE_TIMEOUT)
+    async def _bridge_request(self, body: dict) -> dict:
+        # Each round runs the `claude` or `agy` CLI, which can take a while (and
+        # longer with web search), so allow more than the shared session's default.
+        timeout = aiohttp.ClientTimeout(total=config.CLI_BRIDGE_TIMEOUT)
         async with self.http.post(
-            _claude_url("messages"), headers=_claude_headers(), json=body, timeout=timeout
+            _bridge_url("messages"), headers=_bridge_headers(), json=body, timeout=timeout
         ) as resp:
             return await _read_json(resp)
 
-    async def _run_claude(
-        self, system: str, prompt: str, tools: dict[str, Tool], attachments: list[Attachment], model: str
+    async def _run_bridge(
+        self,
+        system: str,
+        prompt: str,
+        tools: dict[str, Tool],
+        attachments: list[Attachment],
+        model: str,
+        default: str = "",
     ) -> tuple[str, str]:
+        """`default` is sent when no model is chosen; empty = the server's default."""
+        model = model or default
         content: list[dict] = [
             {
                 "type": "document" if a.mime == PDF else "image",
@@ -398,9 +353,9 @@ class Agent:
                 **({"title": a.filename} if a.mime == PDF and a.filename else {}),
             }
             for a in attachments
-            if a.mime in CLAUDE_TYPES
+            if a.mime in BRIDGE_TYPES
         ]
-        content.append({"type": "text", "text": prompt + _attachment_note(attachments, CLAUDE_TYPES)})
+        content.append({"type": "text", "text": prompt + _attachment_note(attachments, BRIDGE_TYPES)})
         messages: list[dict] = [{"role": "user", "content": content}]
         specs = [
             {"name": t.name, "description": t.description, "input_schema": t.parameters}
@@ -414,7 +369,7 @@ class Agent:
                 body["tools"] = specs
                 if round_ == config.CHAT_MAX_TOOL_ROUNDS:  # out of rounds: answer now
                     body["tool_choice"] = {"type": "none"}
-            data = await self._claude_request(body)
+            data = await self._bridge_request(body)
             blocks = data["content"]
             calls = [b for b in blocks if b["type"] == "tool_use"]
             if not calls:
