@@ -36,10 +36,10 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 # The only Gemini models offered in /models and /model.
 GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash-lite"]
 
-# Claude via the configured claude-api server (https://github.com/Xiao215/claude-api).
+# Claude via the configured cli-bridge server (https://github.com/Xiao215/cli-bridge).
 # All users can select it. Empty URL = off; failures fall back to other providers.
-CLAUDE_API_URL = os.getenv("CLAUDE_API_URL", "http://127.0.0.1:8787")
-CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY", "")  # only if claude-api has API_KEY set
+CLI_BRIDGE_URL = os.getenv("CLI_BRIDGE_URL", "http://127.0.0.1:8787")
+CLI_BRIDGE_KEY = os.getenv("CLI_BRIDGE_KEY", "")  # only if cli-bridge has API_KEY set
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "")  # haiku | sonnet | opus; empty = server default
 CLAUDE_TIMEOUT = int(os.getenv("CLAUDE_TIMEOUT", "300"))  # per request; the CLI can be slow
 
@@ -55,7 +55,7 @@ CHAT_IMAGE_MAX_MB = float(os.getenv("CHAT_IMAGE_MAX_MB", "5"))
 # PDFs go to a model that can read them (Gemini or Claude; Cohere can't, so
 # it's skipped while one can answer). Up to CHAT_MAX_PDFS, each at most
 # CHAT_PDF_MAX_MB. All images and PDFs in one ping together stay under ~14 MB,
-# since Gemini and the claude-api server cap a request at 20 MB once base64'd.
+# since Gemini and the cli-bridge server cap a request at 20 MB once base64'd.
 CHAT_MAX_PDFS = int(os.getenv("CHAT_MAX_PDFS", "2"))
 CHAT_PDF_MAX_MB = float(os.getenv("CHAT_PDF_MAX_MB", "10"))
 # Text files (.txt, .md, .csv, code…) are pasted into the prompt for every

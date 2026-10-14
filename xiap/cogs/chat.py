@@ -47,7 +47,7 @@ EMBED_WAIT = 2
 
 MB = 1024 * 1024
 # Images and PDFs in one ping together stay under this, so the request stays
-# under Gemini's and the claude-api server's 20 MB limit once base64'd.
+# under Gemini's and the cli-bridge server's 20 MB limit once base64'd.
 MAX_INLINE_BYTES = 14 * MB
 # Text files bigger than this aren't downloaded just to be cut off.
 MAX_TEXT_BYTES = 1 * MB
@@ -654,6 +654,6 @@ class ChatCog(commands.Cog):
 
 
 async def setup(bot: XiapBot) -> None:
-    if not (config.GEMINI_API_KEYS or config.COHERE_API_KEYS or config.CLAUDE_API_URL):
+    if not (config.GEMINI_API_KEYS or config.COHERE_API_KEYS or config.CLI_BRIDGE_URL):
         log.warning("No AI chat providers configured — AI chat disabled")
     await bot.add_cog(ChatCog(bot))

@@ -2,7 +2,7 @@ import asyncio
 import time
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 from xiap import config
 from xiap.cogs.chat import ChatCog
@@ -16,7 +16,7 @@ class ModelTests(unittest.IsolatedAsyncioTestCase):
             config,
             GEMINI_API_KEYS=["test-key"],
             COHERE_API_KEYS=[],
-            CLAUDE_API_URL="http://localhost:8787",
+            CLI_BRIDGE_URL="http://localhost:8787",
             CLAUDE_MODEL="",
             CHAT_PROVIDER="auto",
         )
@@ -153,12 +153,20 @@ class ModelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([c.value for c in choices], ["gemini:gemini-test-29"])
 
     async def test_disabled_claude_is_not_listed_or_used(self):
-        with patch.object(config, "CLAUDE_API_URL", ""):
+        with patch.object(config, "CLI_BRIDGE_URL", ""):
             agent = Agent(Mock())
         agent._list_gemini = self.agent._list_gemini
         self.assertNotIn("claude", await agent.list_models())
         self.assertNotIn("claude", [p for p, _ in agent.chain(pick="claude:sonnet")])
         self.assertEqual(agent.chain()[0][0], "gemini")
+
+    async def test_bridge_gemini_models_are_not_listed_as_claude(self):
+        agent = Agent(MagicMock())
+        resp = AsyncMock()
+        resp.status = 200
+        resp.json.return_value = {"data": [{"id": "sonnet"}, {"id": "gemini-3.8-flash-high"}, {"id": "gemini"}]}
+        agent.http.get.return_value.__aenter__.return_value = resp
+        self.assertEqual(await agent._list_claude(), ["sonnet"])
 
     def test_shared_primary_can_be_configured_as_claude(self):
         with patch.object(config, "CHAT_PROVIDER", "claude"):

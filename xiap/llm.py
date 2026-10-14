@@ -7,7 +7,7 @@ rounds, at which point tools are switched off so it has to answer with what it
 has).
 
 Gemini and Cohere round-robin across their configured API keys. Claude goes
-through the configured claude-api server (Anthropic Messages format). All
+through the configured cli-bridge server (Anthropic Messages format). All
 configured providers are available to everyone. Cohere can't read PDFs, so
 when one is attached, providers that can read it go first. If a provider fails
 outright, or takes longer than its deadline, the whole run restarts on the
@@ -32,7 +32,7 @@ log = logging.getLogger(__name__)
 
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 MODEL_LIST_TTL = 3600  # seconds to cache a provider's model list
-# A failed listing (e.g. the claude-api server isn't up yet) is retried this
+# A failed listing (e.g. the cli-bridge server isn't up yet) is retried this
 # soon instead of hiding that provider's models for the full hour.
 MODEL_LIST_RETRY = 60
 # Leave room to send Discord's autocomplete response within its 3s deadline.
@@ -87,13 +87,13 @@ async def _read_json(resp: aiohttp.ClientResponse) -> dict:
 
 
 def _claude_url(endpoint: str) -> str:
-    return f"{config.CLAUDE_API_URL.rstrip('/')}/v1/{endpoint}"
+    return f"{config.CLI_BRIDGE_URL.rstrip('/')}/v1/{endpoint}"
 
 
 def _claude_headers() -> dict[str, str]:
     headers = {"anthropic-version": "2023-06-01"}
-    if config.CLAUDE_API_KEY:
-        headers["x-api-key"] = config.CLAUDE_API_KEY
+    if config.CLI_BRIDGE_KEY:
+        headers["x-api-key"] = config.CLI_BRIDGE_KEY
     return headers
 
 
@@ -151,7 +151,7 @@ class Agent:
             else None
         )
 
-        self.claude_enabled = bool(config.CLAUDE_API_URL)
+        self.claude_enabled = bool(config.CLI_BRIDGE_URL)
 
         # Shared default order; a person's /model pick takes priority.
         available = [p for p in ("claude", "gemini", "cohere") if self.configured(p)]  # "auto" prefers Claude
@@ -210,7 +210,7 @@ class Agent:
                 if not fallback:
                     fallback = [m for m in [self.default_model(provider)] if m]
                     if provider == "claude":
-                        # claude-api accepts these aliases even before discovery succeeds.
+                        # cli-bridge accepts these aliases even before discovery succeeds.
                         fallback = list(dict.fromkeys(fallback + ["sonnet", "opus", "haiku"]))
                 self._model_lists[provider] = (now + MODEL_LIST_RETRY, fallback)
             else:
@@ -227,7 +227,9 @@ class Agent:
     async def _list_claude(self) -> list[str]:
         async with self.http.get(_claude_url("models"), headers=_claude_headers()) as resp:
             data = await _read_json(resp)
-        return [m["id"] for m in data.get("data", [])]
+        # cli-bridge also serves gemini-* models (via the Antigravity CLI);
+        # Gemini is offered through its own API, so list only Claude here.
+        return [m["id"] for m in data.get("data", []) if not m["id"].startswith("gemini")]
 
     async def run(
         self,
@@ -375,7 +377,7 @@ class Agent:
                 messages.append({"role": "tool", "tool_call_id": call.id, "content": json.dumps({"result": result})})
         raise RuntimeError("no answer after tool rounds")
 
-    # --- Claude (via the configured claude-api server) -----------------------
+    # --- Claude (via the configured cli-bridge server) -----------------------
 
     async def _claude_request(self, body: dict) -> dict:
         # Each round runs the `claude` CLI, which can take a while (and longer
