@@ -41,7 +41,7 @@ docker build -t xiap .
 docker run --env-file .env -p 8080:8080 xiap
 ```
 
-The bot serves a health-check endpoint on `:8080` for hosting platforms.
+The bot serves a health-check endpoint on `:8080` for hosting platforms. If it starts before the network is up, it waits until it can look up Discord rather than exiting.
 
 Invite URL: OAuth2 → URL Generator → scopes `bot` + `applications.commands`, permissions **Send Messages**, **Read Message History**, **Embed Links**.
 

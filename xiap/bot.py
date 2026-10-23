@@ -1,5 +1,6 @@
 """XiapBot: a friendly AI-powered Discord bot for the Sunday Social group."""
 
+import asyncio
 import logging
 
 import discord
@@ -43,7 +44,6 @@ class XiapBot(commands.Bot):
         return sorted(commands_list, key=lambda c: c.name)
 
     async def setup_hook(self) -> None:
-        await start_health_server(config.PORT)
         for cog in COGS:
             try:
                 await self.load_extension(cog)
@@ -77,5 +77,26 @@ async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     if not config.DISCORD_TOKEN:
         raise SystemExit("DISCORD_TOKEN is not set. Copy .env.example to .env and fill it in.")
+    await start_health_server(config.PORT)
+    await wait_for_network()
     async with XiapBot() as bot:
         await bot.start(config.DISCORD_TOKEN)
+
+
+async def wait_for_network(host: str = "discord.com", max_delay: float = 60) -> None:
+    """Wait until Discord's address can be looked up. Logging in fails at once without it, so a machine
+    that starts before its Wi-Fi is up would otherwise exit and restart in a loop."""
+    delay, waiting = 2.0, False
+    while True:
+        try:
+            await asyncio.get_running_loop().getaddrinfo(host, 443)
+        except OSError:
+            if not waiting:
+                log.warning("Can't look up %s yet (no network?); waiting before logging in", host)
+                waiting = True
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, max_delay)
+            continue
+        if waiting:
+            log.info("Network is up; logging in")
+        return
