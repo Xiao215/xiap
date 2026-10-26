@@ -8,6 +8,8 @@ A friendly AI Discord bot for the Sunday Social group chat. Mention it (or reply
 
 **Claude and Gemini for everyone** — every user can see and select the Claude and Gemini models the configured [cli-bridge](https://github.com/Xiao215/cli-bridge) server offers (Gemini needs the Antigravity CLI set up next to it), with the same context tools and image/PDF support. All users share the same provider access; model picks remain personal. `CHAT_PROVIDER=auto` defaults to Claude when configured, then falls back to Gemini and Cohere. A personal model pick takes priority over the default. If a provider is down or rate-limited, the bot tries the next one. Temporary model-list failures keep the last known options (or Claude's `sonnet`/`opus`/`haiku` aliases on first startup) and retry after a minute. `OWNER_ID` is no longer used.
 
+**Music from self.mp3** — `/play` a [self.mp3](https://github.com/Xiao215/selfmp3) share link and the bot joins your voice channel and plays it: one song, or every song of a shared tag or playlist, in order. A link shared from a line (`?t=0:42`) starts there. More `/play`s add to the queue. It leaves after two minutes with nothing queued, or a minute after everyone else leaves. Each song counts as a play on the sender's link, so it keeps the link alive like any listener would.
+
 **Slash commands**
 
 | Command | What it does |
@@ -16,6 +18,9 @@ A friendly AI Discord bot for the Sunday Social group chat. Mention it (or reply
 | `/papers today`, `/papers subscribe` | Trending AI papers from Hugging Face, on demand or as a daily digest in a channel |
 | `/poll` | Button-based poll (up to 5 options) with a live results bar |
 | `/remind 1h30m <text>` | Pings you in the channel when time's up |
+| `/play <link>` | Join your voice channel and play a self.mp3 share link (more links queue up) |
+| `/skip`, `/stop`, `/leave` | Skip the song, stop and clear the queue, or leave the channel (you have to be in the bot's channel) |
+| `/queue` | What's playing and what's up next |
 | `/choose a, b, c` | Can't decide? The bot picks |
 | `/context 0-30` | Per-channel cap on how many recent messages the AI may read (0 = none) |
 | `/models`, `/model` | See available AI models and pick one per person. All users have the same choices, including Claude. Type a name in `/model` to filter its 25 suggestions. Every AI reply has a gray tag underneath naming the model that wrote it |
@@ -30,7 +35,7 @@ A friendly AI Discord bot for the Sunday Social group chat. Mention it (or reply
 
 ```bash
 cp .env.example .env   # fill in DISCORD_TOKEN, plus CLI_BRIDGE_URL and/or COHERE_API_KEYS
-pip install -r requirements.txt
+pip install -r requirements.txt   # /play also needs ffmpeg on PATH (brew/apt install ffmpeg)
 python app.py
 ```
 
@@ -43,7 +48,7 @@ docker run --env-file .env -p 8080:8080 xiap
 
 The bot serves a health-check endpoint on `:8080` for hosting platforms. If it starts before the network is up, it waits until it can look up Discord rather than exiting.
 
-Invite URL: OAuth2 → URL Generator → scopes `bot` + `applications.commands`, permissions **Send Messages**, **Read Message History**, **Embed Links**.
+Invite URL: OAuth2 → URL Generator → scopes `bot` + `applications.commands`, permissions **Send Messages**, **Read Message History**, **Embed Links**, plus **Connect** and **Speak** for `/play`.
 
 ## Hosting
 
@@ -67,6 +72,7 @@ xiap/
   cogs/
     chat.py            AI chat (mentions & replies) and its context tools
     models.py          /models, /model: per-user model choice
+    music.py           /play, /skip, /stop, /leave, /queue: self.mp3 share links in voice
     privacy.py         /context, /optout, /optin
     papers.py          /papers: Hugging Face daily papers digest
     stocks.py          /stock price charts

@@ -17,6 +17,7 @@ COGS = (
     "xiap.cogs.fun",
     "xiap.cogs.help",
     "xiap.cogs.models",
+    "xiap.cogs.music",
     "xiap.cogs.privacy",
     "xiap.cogs.stocks",
     "xiap.cogs.papers",

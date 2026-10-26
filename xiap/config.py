@@ -73,6 +73,12 @@ CHAT_MAX_TOOL_ROUNDS = int(os.getenv("CHAT_MAX_TOOL_ROUNDS", "4"))
 PAPERS_HOUR = int(os.getenv("PAPERS_HOUR", "9"))
 TIMEZONE = os.getenv("TIMEZONE", "America/Toronto")
 
+# self.mp3's doorman, which serves its share links' songs for /play
+# (https://github.com/Xiao215/selfmp3, docs/features/share-links.md).
+SELFMP3_DOORMAN_URL = os.getenv(
+    "SELFMP3_DOORMAN_URL", "https://selfmp3-doorman.xiaozhang20030215.workers.dev"
+).rstrip("/")
+
 # Port for the tiny HTTP health-check server (Cloud Run & friends).
 PORT = int(os.getenv("PORT", "8080"))
 
