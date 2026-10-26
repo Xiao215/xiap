@@ -2,10 +2,14 @@ import asyncio
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from xiap.cogs import music
-from xiap.cogs.music import LinkError, Player, ShareRef, Song, parse_link, parse_start, songs_from
+from xiap.cogs.music import (
+    PLAYED, LinkError, Player, ShareRef, Song, cover_color, oklch_to_rgb, panel_embed, parse_link, parse_start,
+    progress_bar, songs_from,
+)
 
 ID, KEY = "bc4be89979795352", "49244069fcb5646a"
 
@@ -18,7 +22,10 @@ def entry(n: int, *, gone: bool = False, audio: bool = True, duration: int = 200
             "title": f"Song {n}",
             "artist": "五月天",
             "duration": duration,
+            "album": "",
             "audio": {"key": f"audio/{n}.m4a", "size": 1, "mime": "audio/mp4"} if audio else None,
+            "cover": {"key": f"covers/{n}.jpg", "size": 1} if n == 1 else None,
+            "coverTone": {"hue": 0, "chroma": 0, "palette": [{"l": 1, "c": 0, "h": 0, "share": 1}]},
         },
     }
 
@@ -57,11 +64,42 @@ class SongsFromTests(unittest.TestCase):
         self.assertEqual(songs[0].sender, "Xiao")
         self.assertIsNone(songs[0].start)  # a start only belongs to a one-song link
         self.assertTrue(songs[0].audio_url.endswith(f"/v1/share/{ID}/files/e1/audio?k={KEY}"))
+        self.assertTrue(songs[0].cover_url.endswith(f"/v1/share/{ID}/files/e1/cover?k={KEY}"))
+        self.assertTrue(songs[0].page_url.endswith(f"/l/{ID}/{KEY}"))
+        self.assertEqual(songs[0].color, 0xFFFFFF)
 
     def test_start_applies_to_a_song_unless_past_its_end(self):
         link = {"kind": "song", "from": {"name": "Xiao"}, "entries": [entry(1, duration=200)]}
         self.assertEqual(songs_from(link, ShareRef(ID, KEY, 42))[0].start, 42)
         self.assertIsNone(songs_from(link, ShareRef(ID, KEY, 500))[0].start)
+
+
+class PanelTests(unittest.TestCase):
+    def test_progress_bar(self):
+        self.assertEqual(progress_bar(0, 100, width=5), "●────  0:00 / 1:40")
+        self.assertEqual(progress_bar(50, 100, width=5), "━━●──  0:50 / 1:40")
+        self.assertEqual(progress_bar(100, 100, width=5), "━━━━●  1:40 / 1:40")
+        self.assertEqual(progress_bar(83, 0), "1:23")  # length unknown
+
+    def test_cover_colours(self):
+        self.assertEqual(oklch_to_rgb(1, 0, 0), 0xFFFFFF)
+        self.assertEqual(oklch_to_rgb(0, 0, 0), 0x000000)
+        red = oklch_to_rgb(0.628, 0.2577, 29.23)  # sRGB red in OKLCH
+        self.assertTrue(red >> 16 > 0xF0 and red & 0xFFFF < 0x0808, hex(red))
+        tone = {"palette": [{"l": 0, "c": 0, "h": 0, "share": 0.2}, {"l": 1, "c": 0, "h": 0, "share": 0.8}]}
+        self.assertEqual(cover_color(tone), 0xFFFFFF)
+        self.assertIsNone(cover_color(None))
+
+    def test_panel(self):
+        s = Song("恋風", "幾田りら", 182, "https://x/a", "Xiao", album="Sketch", cover_url="https://x/c",
+                 page_url="https://x/l", link_name="jpop", color=0x123456)
+        embed = panel_embed(s, 60, "▶️ Playing", up_next=song(2), more=3)
+        self.assertEqual(embed.title, "恋風")
+        self.assertIn("幾田りら · Sketch", embed.description)
+        self.assertIn("1:00 / 3:02", embed.description)
+        self.assertEqual(embed.fields[0].value, "**Song 2** · and 3 more")
+        self.assertEqual(embed.thumbnail.url, "https://x/c")
+        self.assertEqual(embed.footer.text, "▶️ Playing · from Xiao's link · jpop")
 
 
 class FakeVoice:
@@ -71,6 +109,8 @@ class FakeVoice:
         self.guild = MagicMock(id=1)
         self.played: list[str] = []
         self.disconnect = AsyncMock()
+        self.pause = MagicMock()
+        self.resume = MagicMock()
         self._after = None
 
     def play(self, source, after):
@@ -91,10 +131,17 @@ class PlayerTests(unittest.IsolatedAsyncioTestCase):
         self.cog = MagicMock(players={})
         self.cog.download = AsyncMock(side_effect=self._download)
         self.voice = FakeVoice()
-        self.channel = MagicMock(send=AsyncMock())
+        self.panels: list[MagicMock] = []
+        self.channel = MagicMock(send=AsyncMock(side_effect=self._send))
         patcher = patch.object(music.discord, "FFmpegOpusAudio", side_effect=lambda path, **kw: path)
         patcher.start()
         self.addCleanup(patcher.stop)
+
+    async def _send(self, content=None, **kwargs):
+        message = MagicMock(edit=AsyncMock(), content=content, kwargs=kwargs)
+        if "embed" in kwargs:
+            self.panels.append(message)
+        return message
 
     async def _download(self, s: Song) -> str:
         fd, path = tempfile.mkstemp()
@@ -107,28 +154,91 @@ class PlayerTests(unittest.IsolatedAsyncioTestCase):
         return player
 
     async def settle(self):
-        for _ in range(5):
+        for _ in range(10):
             await asyncio.sleep(0)
+
+    def last_edit(self, panel: MagicMock) -> dict:
+        return panel.edit.await_args.kwargs
 
     async def test_plays_in_order_and_skips(self):
         player = self.new_player()
         player.add([song(1), song(2)])
         await self.settle()
         self.assertEqual(player.current.title, "Song 1")
-        player.skip()
+        player.skip("Ken")
         await self.settle()
         self.assertEqual(player.current.title, "Song 2")
         self.assertEqual(len(self.voice.played), 2)
         self.assertFalse(os.path.exists(self.voice.played[0]))  # the temp file goes once played
         await player.leave()
 
+    async def test_each_song_gets_a_panel_that_loses_its_buttons_when_it_ends(self):
+        player = self.new_player()
+        player.add([song(1), song(2)])
+        await self.settle()
+        self.assertEqual(len(self.panels), 1)
+        self.assertIsNotNone(self.panels[0].kwargs["view"])
+        self.assertEqual(self.panels[0].kwargs["embed"].fields[0].value, "**Song 2**")  # up next
+        self.voice.finish()
+        await self.settle()
+        closed = self.last_edit(self.panels[0])
+        self.assertIsNone(closed["view"])
+        self.assertTrue(closed["embed"].footer.text.startswith(PLAYED))
+        self.assertEqual(len(self.panels), 2)
+        player.skip("Ken")
+        await self.settle()
+        self.assertTrue(self.last_edit(self.panels[1])["embed"].footer.text.startswith("⏭️ Skipped by Ken"))
+        await player.leave()
+
+    async def test_pause_and_resume_hold_the_position(self):
+        now = [100.0]
+        with patch.object(music, "time", SimpleNamespace(monotonic=lambda: now[0])):
+            player = self.new_player()
+            player.add([Song("A", "", 300, "https://x/a", "Xiao")])
+            await self.settle()
+            now[0] += 30
+            self.assertTrue(player.pause("Ken"))
+            self.assertFalse(player.pause("Ken"))  # already paused
+            now[0] += 500
+            self.assertEqual(player.position(), 30)
+            self.assertIn("Paused by Ken", player.panel_embed().footer.text)
+            self.assertTrue(player.resume())
+            now[0] += 10
+            self.assertEqual(player.position(), 40)
+            self.voice.pause.assert_called_once()
+            self.voice.resume.assert_called_once()
+            await player.leave()
+
+    async def test_leaves_after_a_long_pause(self):
+        with patch.object(music, "PAUSE_SECONDS", 0), patch.object(music, "PANEL_SECONDS", 0.01):
+            player = self.new_player()
+            player.add([song(1), song(2)])
+            await self.settle()
+            player.pause("Ken")
+            await asyncio.wait_for(player.task, 1)
+        self.voice.disconnect.assert_awaited()
+        self.assertNotIn(1, self.cog.players)
+        self.assertIn("💤", self.last_edit(self.panels[0])["embed"].footer.text)
+
+    async def test_progress_moves_while_playing(self):
+        with patch.object(music, "PANEL_SECONDS", 0.01):
+            player = self.new_player()
+            player.add([song(1)])
+            await self.settle()
+            await asyncio.sleep(0.05)
+            self.assertTrue(self.panels[0].edit.await_count >= 2)
+            self.assertIsNotNone(self.last_edit(self.panels[0])["view"])
+            await player.leave("👋 Ken sent me away")
+        self.assertIn("Ken sent me away", self.last_edit(self.panels[0])["embed"].footer.text)
+
     async def test_stop_clears_the_queue_and_leave_disconnects(self):
         player = self.new_player()
         player.add([song(1), song(2), song(3)])
         await self.settle()
-        player.stop()
+        player.stop("Ken")
         await self.settle()
         self.assertFalse(player.busy)
+        self.assertIn("Stopped by Ken", self.last_edit(self.panels[0])["embed"].footer.text)
         await player.leave()
         self.voice.disconnect.assert_awaited()
         self.assertNotIn(1, self.cog.players)

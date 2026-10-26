@@ -2,16 +2,20 @@
 
 A self.mp3 share link (…/l/<id>/<key>) lends its sender's songs to anyone who
 has it: the doorman answers with the link's songs and serves each one's audio
-from the sender's bucket. The bot joins the caller's voice channel and plays
-them in order; /skip, /stop and /leave control it, and /queue shows what's next.
+and cover from the sender's bucket. The bot joins the caller's voice channel and
+plays them in order. Each song gets a now-playing panel (cover, progress bar,
+what's next) with buttons to pause, skip, stop and leave; /pause, /resume,
+/skip, /stop, /leave and /queue do the same from the command line.
 """
 
 import asyncio
 import contextlib
 import logging
+import math
 import os
 import re
 import tempfile
+import time
 from collections import deque
 from dataclasses import dataclass
 from urllib.parse import parse_qs, urlparse
@@ -29,8 +33,12 @@ LINK_RE = re.compile(r"/l/([0-9a-f]{16})/([0-9a-f]{16})/?$")
 URL_RE = re.compile(r"https?://\S+")
 IDLE_SECONDS = 120  # leave after this long with nothing queued
 EMPTY_SECONDS = 60  # leave after this long alone in the channel
+PAUSE_SECONDS = 600  # leave after this long paused
+PANEL_SECONDS = 15  # how often the panel's progress bar moves
+BAR_WIDTH = 16
 MAX_SONG_MB = 200
 QUEUE_SHOWN = 10
+PLAYED = "✅ Played"
 
 
 @dataclass(frozen=True)
@@ -48,6 +56,11 @@ class Song:
     audio_url: str
     sender: str
     start: int | None = None
+    album: str = ""
+    cover_url: str | None = None
+    page_url: str | None = None  # the link's own page
+    link_name: str = ""
+    color: int | None = None  # the cover's main colour, for the panel's stripe
 
 
 class LinkError(Exception):
@@ -80,14 +93,44 @@ def parse_link(text: str) -> ShareRef | None:
     return None
 
 
+def oklch_to_rgb(lightness: float, chroma: float, hue: float) -> int:
+    """An OKLCH colour (how self.mp3 keeps a cover's swatches) as 0xRRGGBB, clipped to sRGB."""
+    a, b = chroma * math.cos(math.radians(hue)), chroma * math.sin(math.radians(hue))
+    l_ = (lightness + 0.3963377774 * a + 0.2158037573 * b) ** 3
+    m_ = (lightness - 0.1055613458 * a - 0.0638541728 * b) ** 3
+    s_ = (lightness - 0.0894841775 * a - 1.2914855480 * b) ** 3
+    linear = (
+        4.0767416621 * l_ - 3.3077115913 * m_ + 0.2309699292 * s_,
+        -1.2684380046 * l_ + 2.6097574011 * m_ - 0.3413193965 * s_,
+        -0.0041960863 * l_ - 0.7034186147 * m_ + 1.7076147010 * s_,
+    )
+    value = 0
+    for x in linear:
+        x = min(max(x, 0.0), 1.0)
+        x = 12.92 * x if x <= 0.0031308 else 1.055 * x ** (1 / 2.4) - 0.055
+        value = value << 8 | round(x * 255)
+    return value
+
+
+def cover_color(tone: dict | None) -> int | None:
+    """The swatch that covers most of the cover."""
+    palette = (tone or {}).get("palette") or []
+    if not palette:
+        return None
+    main = max(palette, key=lambda swatch: swatch.get("share", 0))
+    return oklch_to_rgb(main["l"], main["c"], main["h"])
+
+
 def songs_from(link: dict, ref: ShareRef) -> list[Song]:
     """The link's songs that can still play. A start only applies to a one-song link."""
+    base = config.SELFMP3_DOORMAN_URL
     sender = link.get("from", {}).get("name") or "someone"
     songs = []
     for entry in link.get("entries", []):
         song = entry.get("song") or {}
         if entry.get("gone") or not song.get("audio"):
             continue
+        files = f"{base}/v1/share/{ref.id}/files/{entry['id']}"
         duration = int(song.get("duration") or 0)
         start = ref.start if link.get("kind") == "song" else None
         if start is not None and duration and start >= duration:
@@ -96,9 +139,14 @@ def songs_from(link: dict, ref: ShareRef) -> list[Song]:
             title=song.get("title") or "Untitled",
             artist=song.get("artist") or "",
             duration=duration,
-            audio_url=f"{config.SELFMP3_DOORMAN_URL}/v1/share/{ref.id}/files/{entry['id']}/audio?k={ref.key}",
+            audio_url=f"{files}/audio?k={ref.key}",
             sender=sender,
             start=start,
+            album=song.get("album") or "",
+            cover_url=f"{files}/cover?k={ref.key}" if song.get("cover") else None,
+            page_url=f"{base}/l/{ref.id}/{ref.key}",
+            link_name=link.get("name") or "",
+            color=cover_color(song.get("coverTone")),
         ))
     return songs
 
@@ -118,21 +166,102 @@ def describe(song: Song) -> str:
     return line
 
 
+def progress_bar(position: float, duration: int, width: int = BAR_WIDTH) -> str:
+    """`━━━━●───────  1:23 / 3:02`, or just the time played when the length is unknown."""
+    if not duration:
+        return fmt_time(int(position))
+    done = min(width - 1, int(position / duration * width))
+    return f"{'━' * done}●{'─' * (width - 1 - done)}  {fmt_time(int(position))} / {fmt_time(duration)}"
+
+
+def panel_embed(song: Song, position: float, status: str, up_next: Song | None = None, more: int = 0) -> discord.Embed:
+    byline = " · ".join(part for part in (song.artist, song.album) if part)
+    embed = discord.Embed(
+        title=song.title[:256],
+        url=song.page_url,
+        description=f"{byline}\n\n{progress_bar(position, song.duration)}".strip(),
+        color=song.color,
+    )
+    if up_next:
+        embed.add_field(name="Up next", value=describe(up_next) + (f" · and {more} more" if more else ""), inline=False)
+    if song.cover_url:
+        embed.set_thumbnail(url=song.cover_url)
+    footer = f"{status} · from {song.sender}'s link"
+    if song.link_name and song.link_name != song.title:
+        footer += f" · {song.link_name}"
+    embed.set_footer(text=footer[:2048])
+    return embed
+
+
 async def _error_text(resp: aiohttp.ClientResponse) -> str:
     with contextlib.suppress(Exception):
         return (await resp.json()).get("error") or resp.reason
     return resp.reason or f"HTTP {resp.status}"
 
 
+class Controls(discord.ui.View):
+    """A panel's buttons. Only people in the bot's voice channel can use them."""
+
+    def __init__(self, player: "Player") -> None:
+        super().__init__(timeout=None)
+        self.player = player
+        self.sync()
+
+    def sync(self) -> None:
+        paused = self.player.paused
+        self.pause_button.label = "Resume" if paused else "Pause"
+        self.pause_button.emoji = "▶️" if paused else "⏸️"
+        self.pause_button.style = discord.ButtonStyle.success if paused else discord.ButtonStyle.secondary
+
+    async def _allowed(self, interaction: discord.Interaction) -> bool:
+        return await self.player.cog.controller(interaction, self.player) is not None
+
+    @discord.ui.button(label="Pause", emoji="⏸️", style=discord.ButtonStyle.secondary)
+    async def pause_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not await self._allowed(interaction):
+            return
+        if self.player.paused:
+            self.player.resume()
+        else:
+            self.player.pause(interaction.user.display_name)
+        self.sync()
+        await interaction.response.edit_message(embed=self.player.panel_embed(), view=self)
+
+    @discord.ui.button(label="Skip", emoji="⏭️", style=discord.ButtonStyle.secondary)
+    async def skip_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if await self._allowed(interaction):
+            await interaction.response.defer()
+            self.player.skip(interaction.user.display_name)
+
+    @discord.ui.button(label="Stop", emoji="⏹️", style=discord.ButtonStyle.secondary)
+    async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if await self._allowed(interaction):
+            await interaction.response.defer()
+            self.player.stop(interaction.user.display_name)
+
+    @discord.ui.button(label="Leave", emoji="👋", style=discord.ButtonStyle.danger)
+    async def leave_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if await self._allowed(interaction):
+            await interaction.response.defer()
+            await self.player.leave(f"👋 {interaction.user.display_name} sent me away")
+
+
 class Player:
-    """One guild's voice connection and queue. It leaves when idle, stopped or left alone."""
+    """One guild's voice connection and queue. It leaves when idle, stopped, paused too long or left alone."""
 
     def __init__(self, cog: "MusicCog", voice: discord.VoiceClient, channel: discord.abc.Messageable) -> None:
         self.cog = cog
         self.voice = voice
-        self.channel = channel  # where /play was used; now-playing lines go here
+        self.channel = channel  # where /play was used; panels go here
         self.queue: deque[Song] = deque()
         self.current: Song | None = None
+        self.panel: discord.Message | None = None
+        self.controls: Controls | None = None
+        self.outcome: str | None = None  # how the current song ended, for its panel
+        self.paused_by: str | None = None
+        self._played = 0.0  # seconds of the current song played before the last resume
+        self._resumed_at = 0.0
+        self._paused_at: float | None = None
         self._wake = asyncio.Event()
         self._done = asyncio.Event()
         self.task = asyncio.create_task(self._run())
@@ -141,21 +270,89 @@ class Player:
     def busy(self) -> bool:
         return self.current is not None or bool(self.queue)
 
+    @property
+    def paused(self) -> bool:
+        return self._paused_at is not None
+
+    def position(self) -> float:
+        """Seconds into the current song."""
+        if self.current is None:
+            return 0.0
+        running = 0.0 if self.paused else time.monotonic() - self._resumed_at
+        position = (self.current.start or 0) + self._played + running
+        return min(position, self.current.duration) if self.current.duration else position
+
     def add(self, songs: list[Song]) -> None:
         self.queue.extend(songs)
         self._wake.set()
 
-    def skip(self) -> None:
+    def pause(self, by: str) -> bool:
+        if self.current is None or self.paused:
+            return False
+        self.voice.pause()
+        now = time.monotonic()
+        self._played += now - self._resumed_at
+        self._paused_at, self.paused_by = now, by
+        return True
+
+    def resume(self) -> bool:
+        if not self.paused:
+            return False
+        self.voice.resume()
+        self._resumed_at, self._paused_at, self.paused_by = time.monotonic(), None, None
+        return True
+
+    def skip(self, by: str) -> None:
+        self.outcome = f"⏭️ Skipped by {by}"
         self.voice.stop()  # the `after` callback moves on to the next song
 
-    def stop(self) -> None:
+    def stop(self, by: str) -> None:
         self.queue.clear()
+        self.outcome = f"⏹️ Stopped by {by}"
         self.voice.stop()
 
-    async def leave(self) -> None:
+    async def leave(self, outcome: str = "👋 Left the channel") -> None:
+        self.outcome = self.outcome or outcome
         self.task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await self.task
+
+    def panel_embed(self, ended: str | None = None) -> discord.Embed:
+        if ended:
+            position = self.current.duration if ended == PLAYED and self.current.duration else self.position()
+            return panel_embed(self.current, position, ended)
+        status = f"⏸️ Paused by {self.paused_by}" if self.paused else "▶️ Playing"
+        up_next = self.queue[0] if self.queue else None
+        return panel_embed(self.current, self.position(), status, up_next, max(len(self.queue) - 1, 0))
+
+    async def refresh_panel(self) -> None:
+        if self.panel is None or self.current is None:
+            return
+        if self.controls:
+            self.controls.sync()
+        try:
+            await self.panel.edit(embed=self.panel_embed(), view=self.controls)
+        except discord.NotFound:
+            self.panel = None  # someone deleted it; keep playing without one
+        except discord.HTTPException as e:
+            log.warning("Couldn't update the panel: %s", e)
+
+    async def _post_panel(self) -> None:
+        self.controls = Controls(self)
+        try:
+            self.panel = await self.channel.send(embed=self.panel_embed(), view=self.controls)
+        except discord.HTTPException as e:
+            log.warning("Couldn't post the panel: %s", e)
+            self.panel = None
+
+    async def _close_panel(self) -> None:
+        """The panel keeps the song and how it ended, without buttons; the next song gets a new one."""
+        if self.controls:
+            self.controls.stop()
+        if self.panel is not None:
+            with contextlib.suppress(discord.HTTPException):
+                await self.panel.edit(embed=self.panel_embed(self.outcome or PLAYED), view=None)
+        self.panel = self.controls = None
 
     async def _run(self) -> None:
         loop = asyncio.get_running_loop()
@@ -169,6 +366,7 @@ class Player:
                         return
                     continue
                 self.current = self.queue.popleft()
+                self.outcome = self.paused_by = self._paused_at = None
                 try:
                     path = await self.cog.download(self.current)
                 except LinkError as e:
@@ -181,11 +379,21 @@ class Player:
                     source = discord.FFmpegOpusAudio(path, before_options=before, options="-vn")
                     self._done.clear()
                     self.voice.play(source, after=lambda e: self._finished(loop, e))
-                    await self._say(f"🎶 Now playing {describe(self.current)} · from {self.current.sender}'s link")
-                    await self._done.wait()
+                    self._played, self._resumed_at = 0.0, time.monotonic()
+                    await self._post_panel()
+                    while not self._done.is_set():
+                        with contextlib.suppress(TimeoutError):
+                            await asyncio.wait_for(self._done.wait(), PANEL_SECONDS)
+                        if self.paused and time.monotonic() - self._paused_at >= PAUSE_SECONDS:
+                            self.outcome = f"💤 Paused for {PAUSE_SECONDS // 60} minutes, so I left"
+                            await self._say(f"{self.outcome}.")
+                            return
+                        if not self._done.is_set() and not self.paused:
+                            await self.refresh_panel()
                 finally:
                     with contextlib.suppress(OSError):
                         os.remove(path)
+                    await self._close_panel()
                     self.current = None
         except Exception:
             log.exception("Player crashed")
@@ -262,19 +470,21 @@ class MusicCog(commands.Cog):
                 raise LinkError(f"couldn't download it ({e.__class__.__name__}).") from e
             raise
 
-    async def _player_for(self, interaction: discord.Interaction) -> Player | None:
-        """The caller's player, if they're in the voice channel it plays in; otherwise says why not."""
-        player = self.players.get(interaction.guild_id)
-        if player is None:
+    async def controller(self, interaction: discord.Interaction, player: Player | None = None) -> Player | None:
+        """The guild's player, if the caller is in its voice channel; otherwise says why not.
+
+        `player` is the one a panel belongs to: an old panel's buttons don't steer a newer player."""
+        current = self.players.get(interaction.guild_id)
+        if current is None or (player is not None and player is not current):
             await interaction.response.send_message("I'm not playing anything right now.", ephemeral=True)
             return None
         voice = getattr(interaction.user, "voice", None)
-        if not voice or voice.channel != player.voice.channel:
+        if not voice or voice.channel != current.voice.channel:
             await interaction.response.send_message(
-                f"Join {player.voice.channel.mention} to control the music.", ephemeral=True
+                f"Join {current.voice.channel.mention} to control the music.", ephemeral=True
             )
             return None
-        return player
+        return current
 
     @app_commands.command(name="play", description="Play a self.mp3 share link in your voice channel")
     @app_commands.describe(link="A self.mp3 share link, e.g. https://xiao215.github.io/selfmp3/l/…/…")
@@ -340,34 +550,60 @@ class MusicCog(commands.Cog):
             what += f" from {fmt_time(songs[0].start)}"
         verb = "Queued" if was_busy else "Playing"
         await interaction.followup.send(f"🎧 {verb} {what}, shared by {sender}, in {channel.mention}")
+        if was_busy:
+            await player.refresh_panel()  # its "Up next" may have changed
+
+    @app_commands.command(name="pause", description="Pause the music")
+    @app_commands.guild_only()
+    async def pause(self, interaction: discord.Interaction) -> None:
+        if not (player := await self.controller(interaction)):
+            return
+        if not player.pause(interaction.user.display_name):
+            await interaction.response.send_message("Nothing's playing.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            f"⏸️ Paused. I'll leave if nobody resumes within {PAUSE_SECONDS // 60} minutes."
+        )
+        await player.refresh_panel()
+
+    @app_commands.command(name="resume", description="Carry on playing after a pause")
+    @app_commands.guild_only()
+    async def resume(self, interaction: discord.Interaction) -> None:
+        if not (player := await self.controller(interaction)):
+            return
+        if not player.resume():
+            await interaction.response.send_message("It isn't paused.", ephemeral=True)
+            return
+        await interaction.response.send_message("▶️ Resumed.")
+        await player.refresh_panel()
 
     @app_commands.command(name="skip", description="Skip the song that's playing")
     @app_commands.guild_only()
     async def skip(self, interaction: discord.Interaction) -> None:
-        if not (player := await self._player_for(interaction)):
+        if not (player := await self.controller(interaction)):
             return
         if player.current is None:
             await interaction.response.send_message("Nothing's playing.", ephemeral=True)
             return
         song = player.current
-        player.skip()
+        player.skip(interaction.user.display_name)
         await interaction.response.send_message(f"⏭️ Skipped {describe(song)}")
 
     @app_commands.command(name="stop", description="Stop the music and clear the queue")
     @app_commands.guild_only()
     async def stop(self, interaction: discord.Interaction) -> None:
-        if not (player := await self._player_for(interaction)):
+        if not (player := await self.controller(interaction)):
             return
-        player.stop()
+        player.stop(interaction.user.display_name)
         await interaction.response.send_message("⏹️ Stopped and cleared the queue.")
 
     @app_commands.command(name="leave", description="Stop the music and leave the voice channel")
     @app_commands.guild_only()
     async def leave(self, interaction: discord.Interaction) -> None:
-        if not (player := await self._player_for(interaction)):
+        if not (player := await self.controller(interaction)):
             return
         await interaction.response.send_message(f"👋 Left {player.voice.channel.mention}.")
-        await player.leave()
+        await player.leave(f"👋 {interaction.user.display_name} sent me away")
 
     @app_commands.command(name="queue", description="What's playing and what's up next")
     @app_commands.guild_only()
@@ -393,7 +629,7 @@ class MusicCog(commands.Cog):
             return
         if member.id == self.bot.user.id:
             if after.channel is None:  # disconnected by someone else
-                await player.leave()
+                await player.leave("👋 Disconnected")
             return
         if before.channel != player.voice.channel or after.channel == before.channel:
             return
@@ -402,7 +638,7 @@ class MusicCog(commands.Cog):
             await asyncio.sleep(EMPTY_SECONDS)
             if self.players.get(member.guild.id) is player and not any(not m.bot for m in player.voice.channel.members):
                 await player._say("👋 Everyone left, so I did too.")
-                await player.leave()
+                await player.leave("👋 Everyone left")
 
 
 async def setup(bot: commands.Bot) -> None:
