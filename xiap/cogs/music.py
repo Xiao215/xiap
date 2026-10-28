@@ -13,6 +13,7 @@ import contextlib
 import logging
 import math
 import os
+import random
 import re
 import tempfile
 import time
@@ -31,6 +32,7 @@ log = logging.getLogger(__name__)
 
 LINK_RE = re.compile(r"/l/([0-9a-f]{16})/([0-9a-f]{16})/?$")
 URL_RE = re.compile(r"https?://\S+")
+ENTRY_RE = re.compile(r"[0-9a-f]{12}")
 IDLE_SECONDS = 120  # leave after this long with nothing queued
 EMPTY_SECONDS = 60  # leave after this long alone in the channel
 PAUSE_SECONDS = 600  # leave after this long paused
@@ -46,6 +48,7 @@ class ShareRef:
     id: str
     key: str
     start: int | None  # seconds into the song, from the link's ?t=
+    song: str | None = None  # the entry a list opens on, from the link's ?s=
 
 
 @dataclass(frozen=True)
@@ -88,8 +91,10 @@ def parse_link(text: str) -> ShareRef | None:
     for url in URL_RE.findall(text):
         parsed = urlparse(url.rstrip(">)"))
         if match := LINK_RE.search(parsed.path):
-            start = parse_start(parse_qs(parsed.query).get("t", [None])[0])
-            return ShareRef(match[1], match[2], start)
+            query = parse_qs(parsed.query)
+            start = parse_start(query.get("t", [None])[0])
+            song = query.get("s", [""])[0]
+            return ShareRef(match[1], match[2], start, song if ENTRY_RE.fullmatch(song) else None)
     return None
 
 
@@ -122,10 +127,13 @@ def cover_color(tone: dict | None) -> int | None:
 
 
 def songs_from(link: dict, ref: ShareRef) -> list[Song]:
-    """The link's songs that can still play. A start only applies to a one-song link."""
+    """The link's songs that can still play. A start only applies to a one-song link.
+
+    A list opened on one of its songs (?s=) plays from that song to the end, then the ones before it."""
     base = config.SELFMP3_DOORMAN_URL
     sender = link.get("from", {}).get("name") or "someone"
     songs = []
+    first = 0
     for entry in link.get("entries", []):
         song = entry.get("song") or {}
         if entry.get("gone") or not song.get("audio"):
@@ -135,6 +143,8 @@ def songs_from(link: dict, ref: ShareRef) -> list[Song]:
         start = ref.start if link.get("kind") == "song" else None
         if start is not None and duration and start >= duration:
             start = None
+        if entry["id"] == ref.song and link.get("kind") == "list":
+            first = len(songs)
         songs.append(Song(
             title=song.get("title") or "Untitled",
             artist=song.get("artist") or "",
@@ -148,7 +158,7 @@ def songs_from(link: dict, ref: ShareRef) -> list[Song]:
             link_name=link.get("name") or "",
             color=cover_color(song.get("coverTone")),
         ))
-    return songs
+    return songs[first:] + songs[:first]
 
 
 def fmt_time(seconds: int) -> str:
@@ -212,6 +222,8 @@ class Controls(discord.ui.View):
         self.pause_button.label = "Resume" if paused else "Pause"
         self.pause_button.emoji = "▶️" if paused else "⏸️"
         self.pause_button.style = discord.ButtonStyle.success if paused else discord.ButtonStyle.secondary
+        self.shuffle_button.label = "Shuffle on" if self.player.shuffled else "Shuffle off"
+        self.shuffle_button.style = discord.ButtonStyle.success if self.player.shuffled else discord.ButtonStyle.secondary
 
     async def _allowed(self, interaction: discord.Interaction) -> bool:
         return await self.player.cog.controller(interaction, self.player) is not None
@@ -232,6 +244,14 @@ class Controls(discord.ui.View):
         if await self._allowed(interaction):
             await interaction.response.defer()
             self.player.skip(interaction.user.display_name)
+
+    @discord.ui.button(label="Shuffle off", emoji="🔀", style=discord.ButtonStyle.secondary)
+    async def shuffle_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not await self._allowed(interaction):
+            return
+        self.player.shuffle(not self.player.shuffled)
+        self.sync()
+        await interaction.response.edit_message(embed=self.player.panel_embed(), view=self)
 
     @discord.ui.button(label="Stop", emoji="⏹️", style=discord.ButtonStyle.secondary)
     async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -259,6 +279,8 @@ class Player:
         self.controls: Controls | None = None
         self.outcome: str | None = None  # how the current song ended, for its panel
         self.paused_by: str | None = None
+        self.shuffled = False
+        self._order: list[Song] = []  # the queue as it was added, to go back to when shuffle's turned off
         self._played = 0.0  # seconds of the current song played before the last resume
         self._resumed_at = 0.0
         self._paused_at: float | None = None
@@ -283,8 +305,24 @@ class Player:
         return min(position, self.current.duration) if self.current.duration else position
 
     def add(self, songs: list[Song]) -> None:
-        self.queue.extend(songs)
+        if self.shuffled:
+            self._order.extend(songs)
+            for song in songs:
+                self.queue.insert(random.randint(0, len(self.queue)), song)
+        else:
+            self.queue.extend(songs)
         self._wake.set()
+
+    def shuffle(self, on: bool) -> None:
+        """Shuffle what's queued, or put what's left back in the order it was added."""
+        if on and not self.shuffled:
+            self._order = list(self.queue)
+            self.queue = deque(random.sample(self._order, len(self._order)))
+        elif not on and self.shuffled:
+            left = {id(song) for song in self.queue}
+            self.queue = deque(song for song in self._order if id(song) in left)
+            self._order = []
+        self.shuffled = on
 
     def pause(self, by: str) -> bool:
         if self.current is None or self.paused:
@@ -308,6 +346,7 @@ class Player:
 
     def stop(self, by: str) -> None:
         self.queue.clear()
+        self._order = []
         self.outcome = f"⏹️ Stopped by {by}"
         self.voice.stop()
 
@@ -322,6 +361,8 @@ class Player:
             position = self.current.duration if ended == PLAYED and self.current.duration else self.position()
             return panel_embed(self.current, position, ended)
         status = f"⏸️ Paused by {self.paused_by}" if self.paused else "▶️ Playing"
+        if self.shuffled:
+            status += " · 🔀 Shuffle"
         up_next = self.queue[0] if self.queue else None
         return panel_embed(self.current, self.position(), status, up_next, max(len(self.queue) - 1, 0))
 
@@ -546,6 +587,10 @@ class MusicCog(commands.Cog):
         player.add(songs)
 
         what = describe(songs[0]) if data.get("kind") == "song" else f"**{data.get('name')}** · {len(songs)} songs"
+        if data.get("kind") == "list" and ref.song and f"/files/{ref.song}/" in songs[0].audio_url:
+            what += f", starting on {describe(songs[0])}"
+        if player.shuffled:
+            what += " (shuffled in)"
         if songs[0].start:
             what += f" from {fmt_time(songs[0].start)}"
         verb = "Queued" if was_busy else "Playing"

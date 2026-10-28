@@ -43,6 +43,12 @@ class ParseTests(unittest.TestCase):
         ref = parse_link(f"listen to this <https://xiao215.github.io/selfmp3/l/{ID}/{KEY}?t=1:02:03> ok")
         self.assertEqual(ref, ShareRef(ID, KEY, 3723))
 
+    def test_reads_the_song_a_list_opens_on(self):
+        ref = parse_link(f"https://xiao215.github.io/selfmp3/l/{ID}/{KEY}?s=a1b2c3d4e5f6&t=0:42")
+        self.assertEqual(ref, ShareRef(ID, KEY, 42, "a1b2c3d4e5f6"))
+        for wrong in ("", "nope", "a1b2c3d4e5f60"):
+            self.assertIsNone(parse_link(f"https://xiao215.github.io/selfmp3/l/{ID}/{KEY}?s={wrong}").song)
+
     def test_rejects_other_links(self):
         self.assertIsNone(parse_link("https://youtube.com/watch?v=abc"))
         self.assertIsNone(parse_link(f"https://xiao215.github.io/selfmp3/l/{ID}"))  # cut short
@@ -72,6 +78,14 @@ class SongsFromTests(unittest.TestCase):
         link = {"kind": "song", "from": {"name": "Xiao"}, "entries": [entry(1, duration=200)]}
         self.assertEqual(songs_from(link, ShareRef(ID, KEY, 42))[0].start, 42)
         self.assertIsNone(songs_from(link, ShareRef(ID, KEY, 500))[0].start)
+
+
+    def test_a_list_opened_on_a_song_starts_there_then_wraps(self):
+        link = {"kind": "list", "from": {"name": "Xiao"}, "entries": [entry(1), entry(2), entry(3), entry(4)]}
+        titles = lambda song: [s.title for s in songs_from(link, ShareRef(ID, KEY, None, song))]
+        self.assertEqual(titles("e3"), ["Song 3", "Song 4", "Song 1", "Song 2"])
+        self.assertEqual(titles("e9"), ["Song 1", "Song 2", "Song 3", "Song 4"])  # not in the list
+        self.assertEqual(titles(None), ["Song 1", "Song 2", "Song 3", "Song 4"])
 
 
 class PanelTests(unittest.TestCase):
@@ -208,6 +222,23 @@ class PlayerTests(unittest.IsolatedAsyncioTestCase):
             self.voice.pause.assert_called_once()
             self.voice.resume.assert_called_once()
             await player.leave()
+
+    async def test_shuffle_mixes_the_queue_and_puts_it_back(self):
+        player = self.new_player()
+        player.add([song(n) for n in range(1, 21)])
+        await self.settle()
+        with patch.object(music.random, "sample", side_effect=lambda seq, k: list(reversed(seq))):
+            player.shuffle(True)
+        self.assertEqual(player.queue[0].title, "Song 20")
+        self.assertIn("Shuffle", player.panel_embed().footer.text)
+        player.skip("Ken")
+        await self.settle()
+        self.assertEqual(player.current.title, "Song 20")
+        player.add([song(21)])  # lands somewhere in the shuffled queue
+        player.shuffle(False)
+        self.assertEqual([s.title for s in player.queue], [f"Song {n}" for n in range(2, 20)] + ["Song 21"])
+        self.assertNotIn("Shuffle", player.panel_embed().footer.text)
+        await player.leave()
 
     async def test_leaves_after_a_long_pause(self):
         with patch.object(music, "PAUSE_SECONDS", 0), patch.object(music, "PANEL_SECONDS", 0.01):
