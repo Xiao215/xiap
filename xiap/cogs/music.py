@@ -1,11 +1,13 @@
-"""/play — play a self.mp3 share link in your voice channel.
+"""/play — play a self.mp3 share link or a YouTube link in your voice channel.
 
 A self.mp3 share link (…/l/<id>/<key>) lends its sender's songs to anyone who
 has it: the doorman answers with the link's songs and serves each one's audio
-and cover from the sender's bucket. The bot joins the caller's voice channel and
-plays them in order. Each song gets a now-playing panel (cover, progress bar,
-what's next) with buttons to pause, skip, stop and leave; /pause, /resume,
-/skip, /stop, /leave and /queue do the same from the command line.
+and cover from the sender's bucket. A YouTube video or playlist link is read
+with yt-dlp, which also fetches each video's audio when its turn comes. The bot
+joins the caller's voice channel and plays them in order. Each song gets a
+now-playing panel (cover, progress bar, what's next) with buttons to pause,
+skip, stop and leave; /pause, /resume, /skip, /stop, /leave and /queue do the
+same from the command line.
 """
 
 import asyncio
@@ -15,6 +17,7 @@ import math
 import os
 import random
 import re
+import shutil
 import tempfile
 import time
 from collections import deque
@@ -23,6 +26,7 @@ from urllib.parse import parse_qs, urlparse
 
 import aiohttp
 import discord
+import yt_dlp
 from discord import app_commands
 from discord.ext import commands
 
@@ -33,6 +37,14 @@ log = logging.getLogger(__name__)
 LINK_RE = re.compile(r"/l/([0-9a-f]{16})/([0-9a-f]{16})/?$")
 URL_RE = re.compile(r"https?://\S+")
 ENTRY_RE = re.compile(r"[0-9a-f]{12}")
+YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"}
+VIDEO_RE = re.compile(r"[\w-]{11}")
+PLAYLIST_RE = re.compile(r"[\w-]{2,64}")
+YOUTUBE_PATH_RE = re.compile(r"/(?:shorts|live|embed)/([\w-]{11})/?")
+YOUTUBE_RED = 0xFF0033
+UNAVAILABLE = {"[Private video]", "[Deleted video]"}  # how a playlist lists videos it can't show
+LIVE = {"is_live", "is_upcoming"}
+MAX_PLAYLIST = 200
 IDLE_SECONDS = 120  # leave after this long with nothing queued
 EMPTY_SECONDS = 60  # leave after this long alone in the channel
 PAUSE_SECONDS = 600  # leave after this long paused
@@ -52,18 +64,27 @@ class ShareRef:
 
 
 @dataclass(frozen=True)
+class YouTubeRef:
+    url: str  # what yt-dlp reads: the video's or the playlist's page
+    video: str | None  # the video a playlist opens on, or the video itself
+    playlist: str | None
+    start: int | None  # seconds into the video, from the link's ?t=
+
+
+@dataclass(frozen=True)
 class Song:
     title: str
     artist: str
     duration: int  # seconds; 0 = unknown
-    audio_url: str
-    sender: str
+    audio_url: str  # for YouTube, the video's page, which yt-dlp reads the audio from
+    sender: str  # whoever shared the self.mp3 link, or queued the YouTube one
     start: int | None = None
     album: str = ""
     cover_url: str | None = None
     page_url: str | None = None  # the link's own page
     link_name: str = ""
     color: int | None = None  # the cover's main colour, for the panel's stripe
+    source: str = "selfmp3"  # or "youtube"
 
 
 class LinkError(Exception):
@@ -95,6 +116,44 @@ def parse_link(text: str) -> ShareRef | None:
             start = parse_start(query.get("t", [None])[0])
             song = query.get("s", [""])[0]
             return ShareRef(match[1], match[2], start, song if ENTRY_RE.fullmatch(song) else None)
+    return None
+
+
+def parse_youtube_start(value: str | None) -> int | None:
+    """A YouTube link's ?t=: plain seconds, or 1h2m3s and any part of it."""
+    given = (value or "").strip().lower()
+    match = re.fullmatch(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s?)?", given)
+    if not given or not match:
+        return None
+    hours, minutes, seconds = (int(part or 0) for part in match.groups())
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def parse_youtube(text: str) -> YouTubeRef | None:
+    """The YouTube video or playlist link in `text`.
+
+    A video opened from a playlist (watch?v=…&list=…) means the playlist, starting on that video.
+    A Mix (list=RD…) is YouTube's endless radio rather than a list someone made, so it's just the video."""
+    for url in URL_RE.findall(text):
+        parsed = urlparse(url.rstrip(">)"))
+        host = (parsed.hostname or "").lower()
+        if host not in YOUTUBE_HOSTS:
+            continue
+        query = parse_qs(parsed.query)
+        if host == "youtu.be":
+            video = parsed.path.strip("/")
+        elif match := YOUTUBE_PATH_RE.fullmatch(parsed.path):
+            video = match[1]
+        else:
+            video = query.get("v", [""])[0]
+        video = video if VIDEO_RE.fullmatch(video) else None
+        playlist = query.get("list", [""])[0]
+        playlist = playlist if PLAYLIST_RE.fullmatch(playlist) and not playlist.startswith("RD") else None
+        if playlist:
+            return YouTubeRef(f"https://www.youtube.com/playlist?list={playlist}", video, playlist, None)
+        if video:
+            start = parse_youtube_start(query.get("t", query.get("start", [None]))[0])
+            return YouTubeRef(f"https://www.youtube.com/watch?v={video}", video, None, start)
     return None
 
 
@@ -161,6 +220,95 @@ def songs_from(link: dict, ref: ShareRef) -> list[Song]:
     return songs[first:] + songs[:first]
 
 
+def youtube_songs_from(info: dict, ref: YouTubeRef, by: str) -> list[Song]:
+    """A video, or a playlist's videos that can play. A start only applies to a lone video.
+
+    A playlist opened on one of its videos plays from there to the end, then the ones before it."""
+    is_list = info.get("_type") == "playlist"
+    songs = []
+    first = 0
+    for video in (info.get("entries") or []) if is_list else [info]:
+        if not video or not VIDEO_RE.fullmatch(video.get("id") or ""):
+            continue
+        if video.get("title") in UNAVAILABLE or video.get("live_status") in LIVE:
+            continue
+        duration = int(video.get("duration") or 0)
+        start = None if is_list else ref.start
+        if start is not None and duration and start >= duration:
+            start = None
+        if video["id"] == ref.video:
+            first = len(songs)
+        page = f"https://www.youtube.com/watch?v={video['id']}"
+        songs.append(Song(
+            title=video.get("title") or "Untitled",
+            artist=video.get("channel") or video.get("uploader") or "",
+            duration=duration,
+            audio_url=page,
+            sender=by,
+            start=start,
+            cover_url=f"https://i.ytimg.com/vi/{video['id']}/hqdefault.jpg",
+            page_url=page,
+            link_name=(info.get("title") or "") if is_list else "",
+            color=YOUTUBE_RED,
+            source="youtube",
+        ))
+    return songs[first:] + songs[:first]
+
+
+def _youtube_options(**more) -> dict:
+    options = {"quiet": True, "no_warnings": True, "noprogress": True, "logger": log, **more}
+    if config.YOUTUBE_COOKIES:
+        options["cookiefile"] = config.YOUTUBE_COOKIES
+    return options
+
+
+def _youtube_error(e: Exception) -> LinkError:
+    """yt-dlp's error, without its `ERROR: [youtube] <id>: ` prefix."""
+    text = re.sub(r"^ERROR: (\[[\w:]+\] [\w-]+: )?", "", str(e)).split("\n")[0]
+    if "confirm you" in text and "not a bot" in text:
+        log.warning("YouTube wants a sign-in; set YOUTUBE_COOKIES to a cookies.txt: %s", text)
+        return LinkError("YouTube is blocking me right now (it wants me to sign in).")
+    return LinkError(f"YouTube said: {text}")
+
+
+def youtube_info(url: str) -> dict:
+    """A video's details, or a playlist's videos without opening each one. Blocks; run it in a thread."""
+    options = _youtube_options(extract_flat="in_playlist", playlistend=MAX_PLAYLIST)
+    try:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            return ydl.extract_info(url, download=False)
+    except yt_dlp.utils.YoutubeDLError as e:
+        raise _youtube_error(e) from e
+
+
+def youtube_download(url: str) -> str:
+    """Fetch a video's audio to a temp file. Blocks; run it in a thread."""
+    folder = tempfile.mkdtemp(prefix="xiap-")
+    options = _youtube_options(
+        format="bestaudio/best",
+        outtmpl=os.path.join(folder, "audio.%(ext)s"),
+        noplaylist=True,
+        max_filesize=MAX_SONG_MB * 1024 * 1024,
+    )
+    try:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(url, download=False)
+            if info.get("live_status") in LIVE:
+                raise LinkError("it's a live stream.")
+            ydl.process_ie_result(info, download=True)
+        files = [name for name in os.listdir(folder) if not name.endswith((".part", ".ytdl"))]
+        if not files:  # yt-dlp skips a file over max_filesize rather than failing
+            raise LinkError(f"it's over {MAX_SONG_MB} MB.")
+        fd, path = tempfile.mkstemp(prefix="xiap-", suffix=".audio")
+        os.close(fd)
+        os.replace(os.path.join(folder, files[0]), path)
+        return path
+    except yt_dlp.utils.YoutubeDLError as e:
+        raise _youtube_error(e) from e
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
 def fmt_time(seconds: int) -> str:
     minutes, secs = divmod(seconds, 60)
     hours, minutes = divmod(minutes, 60)
@@ -196,7 +344,10 @@ def panel_embed(song: Song, position: float, status: str, up_next: Song | None =
         embed.add_field(name="Up next", value=describe(up_next) + (f" · and {more} more" if more else ""), inline=False)
     if song.cover_url:
         embed.set_thumbnail(url=song.cover_url)
-    footer = f"{status} · from {song.sender}'s link"
+    if song.source == "youtube":
+        footer = f"{status} · YouTube, queued by {song.sender}"
+    else:
+        footer = f"{status} · from {song.sender}'s link"
     if song.link_name and song.link_name != song.title:
         footer += f" · {song.link_name}"
     embed.set_footer(text=footer[:2048])
@@ -457,7 +608,7 @@ class Player:
 
 
 class MusicCog(commands.Cog):
-    """Plays self.mp3 share links in voice channels, one queue per server."""
+    """Plays self.mp3 share links and YouTube links in voice channels, one queue per server."""
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
@@ -489,6 +640,14 @@ class MusicCog(commands.Cog):
 
     async def download(self, song: Song) -> str:
         """Fetch a song's audio to a temp file, so a failed read can be told apart from a bad file."""
+        if song.source == "youtube":
+            task = asyncio.ensure_future(asyncio.to_thread(youtube_download, song.audio_url))
+            try:
+                return await asyncio.shield(task)
+            except asyncio.CancelledError:
+                # The thread can't be stopped; drop its file once it's done.
+                task.add_done_callback(lambda t: t.cancelled() or t.exception() or os.remove(t.result()))
+                raise
         fd, path = tempfile.mkstemp(prefix="xiap-", suffix=".audio")
         try:
             with os.fdopen(fd, "wb") as f:
@@ -527,14 +686,52 @@ class MusicCog(commands.Cog):
             return None
         return current
 
-    @app_commands.command(name="play", description="Play a self.mp3 share link in your voice channel")
-    @app_commands.describe(link="A self.mp3 share link, e.g. https://xiao215.github.io/selfmp3/l/…/…")
+    async def selfmp3_songs(self, ref: ShareRef) -> tuple[list[Song], str, str]:
+        """A share link's songs, what /play calls them, and who they're from. LinkError says why not, as is."""
+        try:
+            data = await self.fetch_link(ref)
+        except LinkError as e:
+            raise LinkError(f"😕 Couldn't play that: {e}") from e
+        sender = data.get("from", {}).get("name") or "whoever sent it"
+        if data.get("ended"):
+            raise LinkError(f"⌛ **{data.get('name', 'That link')}** has ended — ask {sender} for it again.")
+        songs = songs_from(data, ref)
+        if not songs:
+            raise LinkError(f"😕 None of the songs in that link can play any more — {sender} removed them.")
+        what = describe(songs[0]) if data.get("kind") == "song" else f"**{data.get('name')}** · {len(songs)} songs"
+        if data.get("kind") == "list" and ref.song and f"/files/{ref.song}/" in songs[0].audio_url:
+            what += f", starting on {describe(songs[0])}"
+        return songs, what, f"shared by {sender}"
+
+    async def youtube_songs(self, ref: YouTubeRef, by: str) -> tuple[list[Song], str, str]:
+        """A YouTube link's videos, what /play calls them, and where they're from. LinkError says why not, as is."""
+        try:
+            info = await asyncio.to_thread(youtube_info, ref.url)
+        except LinkError as e:
+            raise LinkError(f"😕 Couldn't play that: {e}") from e
+        if info.get("live_status") in LIVE:
+            raise LinkError("😕 That's a live stream — I can only play videos.")
+        songs = youtube_songs_from(info, ref, by)
+        if not songs:
+            raise LinkError("😕 Nothing in that playlist can play.")
+        if not ref.playlist:
+            return songs, describe(songs[0]), "from YouTube"
+        what = f"**{info.get('title') or 'That playlist'}** · {len(songs)} videos"
+        if ref.video and songs[0].page_url.endswith(ref.video):
+            what += f", starting on {describe(songs[0])}"
+        return songs, what, "from YouTube"
+
+    @app_commands.command(name="play", description="Play a self.mp3 share link or a YouTube link in your voice channel")
+    @app_commands.describe(link="A self.mp3 share link (…/selfmp3/l/…/…), or a YouTube video or playlist link")
     @app_commands.guild_only()
     async def play(self, interaction: discord.Interaction, link: str) -> None:
         ref = parse_link(link)
-        if ref is None:
+        youtube = parse_youtube(link) if ref is None else None
+        if ref is None and youtube is None:
             await interaction.response.send_message(
-                "That doesn't look like a self.mp3 share link — they end in `/l/<id>/<key>`.", ephemeral=True
+                "That doesn't look like a self.mp3 share link (they end in `/l/<id>/<key>`) "
+                "or a YouTube video or playlist link.",
+                ephemeral=True,
             )
             return
         voice_state = interaction.user.voice
@@ -558,17 +755,12 @@ class MusicCog(commands.Cog):
 
         await interaction.response.defer(thinking=True)
         try:
-            data = await self.fetch_link(ref)
+            if ref is not None:
+                songs, what, credit = await self.selfmp3_songs(ref)
+            else:
+                songs, what, credit = await self.youtube_songs(youtube, interaction.user.display_name)
         except LinkError as e:
-            await interaction.followup.send(f"😕 Couldn't play that: {e}")
-            return
-        sender = data.get("from", {}).get("name") or "whoever sent it"
-        if data.get("ended"):
-            await interaction.followup.send(f"⌛ **{data.get('name', 'That link')}** has ended — ask {sender} for it again.")
-            return
-        songs = songs_from(data, ref)
-        if not songs:
-            await interaction.followup.send(f"😕 None of the songs in that link can play any more — {sender} removed them.")
+            await interaction.followup.send(str(e))
             return
 
         try:
@@ -586,15 +778,12 @@ class MusicCog(commands.Cog):
         was_busy = player.busy
         player.add(songs)
 
-        what = describe(songs[0]) if data.get("kind") == "song" else f"**{data.get('name')}** · {len(songs)} songs"
-        if data.get("kind") == "list" and ref.song and f"/files/{ref.song}/" in songs[0].audio_url:
-            what += f", starting on {describe(songs[0])}"
         if player.shuffled:
             what += " (shuffled in)"
         if songs[0].start:
             what += f" from {fmt_time(songs[0].start)}"
         verb = "Queued" if was_busy else "Playing"
-        await interaction.followup.send(f"🎧 {verb} {what}, shared by {sender}, in {channel.mention}")
+        await interaction.followup.send(f"🎧 {verb} {what}, {credit}, in {channel.mention}")
         if was_busy:
             await player.refresh_panel()  # its "Up next" may have changed
 

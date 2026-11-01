@@ -79,6 +79,11 @@ SELFMP3_DOORMAN_URL = os.getenv(
     "SELFMP3_DOORMAN_URL", "https://selfmp3-doorman.xiaozhang20030215.workers.dev"
 ).rstrip("/")
 
+# /play reads YouTube links with yt-dlp. YouTube often asks servers in data
+# centres to sign in first; point this at a cookies.txt exported from a
+# signed-in browser to get past that. Empty = no cookies.
+YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES", "")
+
 # Port for the tiny HTTP health-check server (Cloud Run & friends).
 PORT = int(os.getenv("PORT", "8080"))
 

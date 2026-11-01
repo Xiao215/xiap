@@ -8,7 +8,9 @@ A friendly AI Discord bot for the Sunday Social group chat. Mention it (or reply
 
 **Claude and Gemini for everyone** — every user can see and select the Claude and Gemini models the configured [cli-bridge](https://github.com/Xiao215/cli-bridge) server offers (Gemini needs the Antigravity CLI set up next to it), with the same context tools and image/PDF support. All users share the same provider access; model picks remain personal. `CHAT_PROVIDER=auto` defaults to Claude when configured, then falls back to Gemini and Cohere. A personal model pick takes priority over the default. If a provider is down or rate-limited, the bot tries the next one. Temporary model-list failures keep the last known options (or Claude's `sonnet`/`opus`/`haiku` aliases on first startup) and retry after a minute. `OWNER_ID` is no longer used.
 
-**Music from self.mp3** — `/play` a [self.mp3](https://github.com/Xiao215/selfmp3) share link and the bot joins your voice channel and plays it: one song, or every song of a shared tag or playlist, in order. A link shared from a line (`?t=0:42`) starts there. A playlist link that opens on one of its songs (`?s=…`) starts on that song, then plays the rest and wraps round to the ones before it. More `/play`s add to the queue. Each song gets a now-playing panel — its cover, a progress bar that moves every 15 seconds, what's up next — with **Pause/Resume**, **Skip**, **Shuffle** (on/off — off puts what's left back in order), **Stop** and **Leave** buttons for whoever's in the voice channel; when the song ends, the panel keeps how it ended (played, skipped by…) and a new one is posted. It leaves after two minutes with nothing queued, ten minutes paused, or a minute after everyone else leaves. Each song counts as a play on the sender's link, so it keeps the link alive like any listener would.
+**Music from self.mp3 and YouTube** — `/play` a [self.mp3](https://github.com/Xiao215/selfmp3) share link or a YouTube link and the bot joins your voice channel and plays it: one song, or every song of a shared tag or playlist, in order. A link shared from a line (`?t=0:42`) starts there. A playlist link that opens on one of its songs (`?s=…`) starts on that song, then plays the rest and wraps round to the ones before it. More `/play`s add to the queue. Each song gets a now-playing panel — its cover, a progress bar that moves every 15 seconds, what's up next — with **Pause/Resume**, **Skip**, **Shuffle** (on/off — off puts what's left back in order), **Stop** and **Leave** buttons for whoever's in the voice channel; when the song ends, the panel keeps how it ended (played, skipped by…) and a new one is posted. It leaves after two minutes with nothing queued, ten minutes paused, or a minute after everyone else leaves. Each song counts as a play on the sender's link, so it keeps the link alive like any listener would.
+
+YouTube links work the same way: a video (`youtu.be/…`, `watch?v=…`, Shorts, YouTube Music) plays on its own, from its `?t=` if it has one; a playlist plays its first 200 videos; a video opened from a playlist (`watch?v=…&list=…`) plays that playlist starting on the video, then wraps round. Mixes (`list=RD…`) play just the video, since they're endless. Live streams and private videos are skipped, as is anything over 200 MB of audio. They're read with [yt-dlp](https://github.com/yt-dlp/yt-dlp), which needs [Deno](https://deno.com) to read YouTube (the Docker image has it). If YouTube tells the bot to sign in — it often does to servers in data centres — set `YOUTUBE_COOKIES` to a `cookies.txt` exported from a signed-in browser (a spare account is safest).
 
 **Slash commands**
 
@@ -18,7 +20,7 @@ A friendly AI Discord bot for the Sunday Social group chat. Mention it (or reply
 | `/papers today`, `/papers subscribe` | Trending AI papers from Hugging Face, on demand or as a daily digest in a channel |
 | `/poll` | Button-based poll (up to 5 options) with a live results bar |
 | `/remind 1h30m <text>` | Pings you in the channel when time's up |
-| `/play <link>` | Join your voice channel and play a self.mp3 share link (more links queue up) |
+| `/play <link>` | Join your voice channel and play a self.mp3 share link or a YouTube video or playlist (more links queue up) |
 | `/pause`, `/resume`, `/skip`, `/stop`, `/leave` | The panel's buttons as commands: pause, carry on, skip the song, stop and clear the queue, or leave (you have to be in the bot's channel) |
 | `/queue` | What's playing and what's up next |
 | `/choose a, b, c` | Can't decide? The bot picks |
@@ -35,7 +37,7 @@ A friendly AI Discord bot for the Sunday Social group chat. Mention it (or reply
 
 ```bash
 cp .env.example .env   # fill in DISCORD_TOKEN, plus CLI_BRIDGE_URL and/or COHERE_API_KEYS
-pip install -r requirements.txt   # /play also needs ffmpeg on PATH (brew/apt install ffmpeg)
+pip install -r requirements.txt   # /play also needs ffmpeg on PATH, and deno for YouTube (brew install ffmpeg deno)
 python app.py
 ```
 

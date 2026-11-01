@@ -7,8 +7,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from xiap.cogs import music
 from xiap.cogs.music import (
-    PLAYED, LinkError, Player, ShareRef, Song, cover_color, oklch_to_rgb, panel_embed, parse_link, parse_start,
-    progress_bar, songs_from,
+    PLAYED, YOUTUBE_RED, LinkError, Player, ShareRef, Song, YouTubeRef, cover_color, oklch_to_rgb, panel_embed,
+    parse_link, parse_start, parse_youtube, parse_youtube_start, progress_bar, songs_from, youtube_songs_from,
 )
 
 ID, KEY = "bc4be89979795352", "49244069fcb5646a"
@@ -88,6 +88,76 @@ class SongsFromTests(unittest.TestCase):
         self.assertEqual(titles(None), ["Song 1", "Song 2", "Song 3", "Song 4"])
 
 
+VIDEO, LIST = "dQw4w9WgXcQ", "PLFgquLnL59alCl_2TQvOiD5Vgm1hCaGSI"
+
+
+def video(n: int, **more) -> dict:
+    return {"id": f"video{n:06d}", "title": f"Video {n}", "channel": "Ado", "duration": 200, **more}
+
+
+class YouTubeParseTests(unittest.TestCase):
+    def test_reads_video_links(self):
+        watch = f"https://www.youtube.com/watch?v={VIDEO}"
+        for url in (
+            watch, f"https://youtu.be/{VIDEO}?si=abc", f"https://m.youtube.com/watch?v={VIDEO}&feature=share",
+            f"https://music.youtube.com/watch?v={VIDEO}", f"https://youtube.com/shorts/{VIDEO}",
+            f"<https://www.youtube.com/live/{VIDEO}>",
+        ):
+            self.assertEqual(parse_youtube(f"this one {url}"), YouTubeRef(watch, VIDEO, None, None), url)
+
+    def test_reads_a_start(self):
+        self.assertEqual(parse_youtube(f"https://youtu.be/{VIDEO}?t=1m30s").start, 90)
+        self.assertEqual(parse_youtube(f"https://www.youtube.com/watch?v={VIDEO}&t=42").start, 42)
+        self.assertEqual(parse_youtube_start("1h2m3s"), 3723)
+        self.assertEqual(parse_youtube_start("90s"), 90)
+        for bad in (None, "", "abc", "1:30", "s"):
+            self.assertIsNone(parse_youtube_start(bad), bad)
+
+    def test_reads_playlists_and_the_video_they_open_on(self):
+        page = f"https://www.youtube.com/playlist?list={LIST}"
+        self.assertEqual(parse_youtube(page), YouTubeRef(page, None, LIST, None))
+        opened = parse_youtube(f"https://www.youtube.com/watch?v={VIDEO}&list={LIST}&index=3&t=40")
+        self.assertEqual(opened, YouTubeRef(page, VIDEO, LIST, None))  # a start only belongs to a lone video
+
+    def test_a_mix_is_just_its_video(self):
+        ref = parse_youtube(f"https://www.youtube.com/watch?v={VIDEO}&list=RD{VIDEO}&start_radio=1")
+        self.assertEqual(ref, YouTubeRef(f"https://www.youtube.com/watch?v={VIDEO}", VIDEO, None, None))
+
+    def test_rejects_other_links(self):
+        for url in (
+            "https://www.youtube.com/watch?v=short", "https://www.youtube.com/@ado", "https://notyoutube.com/watch?v="
+            + VIDEO, f"https://xiao215.github.io/selfmp3/l/{ID}/{KEY}", "no link here",
+        ):
+            self.assertIsNone(parse_youtube(url), url)
+
+
+class YouTubeSongsTests(unittest.TestCase):
+    def test_a_video(self):
+        info = {**video(1), "id": VIDEO}
+        [s] = youtube_songs_from(info, YouTubeRef("u", VIDEO, None, 30), "Ken")
+        self.assertEqual((s.title, s.artist, s.duration, s.start, s.sender), ("Video 1", "Ado", 200, 30, "Ken"))
+        self.assertEqual(s.audio_url, f"https://www.youtube.com/watch?v={VIDEO}")
+        self.assertEqual(s.cover_url, f"https://i.ytimg.com/vi/{VIDEO}/hqdefault.jpg")
+        self.assertEqual((s.source, s.color, s.link_name), ("youtube", YOUTUBE_RED, ""))
+        self.assertIsNone(youtube_songs_from(info, YouTubeRef("u", VIDEO, None, 500), "Ken")[0].start)
+
+    def test_a_playlist_skips_what_cant_play_and_starts_where_it_was_opened(self):
+        info = {"_type": "playlist", "title": "J-pop", "entries": [
+            video(1), video(2, title="[Private video]"), video(3), video(4, live_status="is_live"), None, video(5),
+        ]}
+        songs = youtube_songs_from(info, YouTubeRef("u", "video000003", LIST, None), "Ken")
+        self.assertEqual([s.title for s in songs], ["Video 3", "Video 5", "Video 1"])
+        self.assertEqual(songs[0].link_name, "J-pop")
+        self.assertEqual([s.title for s in youtube_songs_from(info, YouTubeRef("u", None, LIST, None), "Ken")],
+                         ["Video 1", "Video 3", "Video 5"])
+
+    def test_youtube_errors_read_plainly(self):
+        error = music._youtube_error(Exception(f"ERROR: [youtube] {VIDEO}: Video unavailable\nmore"))
+        self.assertEqual(str(error), "YouTube said: Video unavailable")
+        error = music._youtube_error(Exception(f"ERROR: [youtube] {VIDEO}: Sign in to confirm you’re not a bot."))
+        self.assertIn("blocking me", str(error))
+
+
 class PanelTests(unittest.TestCase):
     def test_progress_bar(self):
         self.assertEqual(progress_bar(0, 100, width=5), "●────  0:00 / 1:40")
@@ -114,6 +184,10 @@ class PanelTests(unittest.TestCase):
         self.assertEqual(embed.fields[0].value, "**Song 2** · and 3 more")
         self.assertEqual(embed.thumbnail.url, "https://x/c")
         self.assertEqual(embed.footer.text, "▶️ Playing · from Xiao's link · jpop")
+
+    def test_youtube_panel(self):
+        s = Song("Usseewa", "Ado", 205, "https://y/v", "Ken", link_name="J-pop", source="youtube")
+        self.assertEqual(panel_embed(s, 0, "▶️ Playing").footer.text, "▶️ Playing · YouTube, queued by Ken · J-pop")
 
 
 class FakeVoice:
