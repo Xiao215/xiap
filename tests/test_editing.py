@@ -9,7 +9,7 @@ from lxml import etree
 from xiap import config, render
 from xiap.cogs.chat import ChatCog, Files
 from xiap.editing import EditError, EditSession, TextFile, WordFile, edited_name
-from xiap.llm import PDF, Agent, Attachment, Output
+from xiap.llm import PDF, Agent, Attachment, ToolResult
 
 NS = (
     'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
@@ -530,7 +530,7 @@ class PagesToModelTests(unittest.IsolatedAsyncioTestCase):
         settings.start()
         self.addCleanup(settings.stop)
         self.agent = Agent(Mock())
-        pages = Output("page 1 of 1", [Attachment(PDF, b"%PDF-1.7 fake", "trip p1.pdf")])
+        pages = ToolResult("page 1 of 1", [Attachment(PDF, b"%PDF-1.7 fake", "trip p1.pdf")])
         self.tools = [SimpleNamespace(name="render", description="", parameters={}, run=AsyncMock(return_value=pages))]
 
     async def test_claude_and_gemini_get_the_pdf_inside_the_tool_result(self):
@@ -540,20 +540,20 @@ class PagesToModelTests(unittest.IsolatedAsyncioTestCase):
         ])
         await self.agent.run("system", "prompt", self.tools)
         result = self.agent._bridge_request.call_args.args[0]["messages"][-1]["content"][0]
-        self.assertEqual(result["content"][0], {"type": "text", "text": "page 1 of 1"})
-        self.assertEqual(result["content"][1]["type"], "document")
-        self.assertEqual(result["content"][1]["title"], "trip p1.pdf")
+        self.assertEqual(result["content"][0]["type"], "document")
+        self.assertEqual(result["content"][0]["title"], "trip p1.pdf")
+        self.assertEqual(result["content"][1], {"type": "text", "text": "page 1 of 1"})
 
     async def test_the_final_check_shows_pages(self):
         session = EditSession([WordFile("trip.docx", "Bob", docx())])
         session.files["trip.docx"].replace_text("Union", "the Library")
-        pages = Output("pages 1 of 1 after your edits", [Attachment(PDF, b"%PDF fake", "trip p1.pdf")])
+        pages = ToolResult("pages 1 of 1 after your edits", [Attachment(PDF, b"%PDF fake", "trip p1.pdf")])
         with patch("xiap.editing.render.soffice", return_value="/usr/bin/soffice"), \
                 patch.object(WordFile, "changed_pages", AsyncMock(return_value=pages)):
             note = await session.review()
         self.assertIn("after your edits", note.text)
         self.assertIn("nothing should run off the page", note.text)
-        self.assertEqual(len(note.attachments), 1)
+        self.assertEqual(len(note.media), 1)
 
     async def test_cohere_is_told_it_cant_see_pages(self):
         with patch.object(config, "COHERE_API_KEYS", ["k"]), patch.object(config, "CLI_BRIDGE_URL", ""):
@@ -580,11 +580,11 @@ class RenderTests(unittest.IsolatedAsyncioTestCase):
         doc = WordFile("trip.docx", "Bob", docx(TEXT + WIDE_TABLE + IMAGE + PAGE))
         out = await doc.render()
         self.assertIn("page 1 of 1", out.text)
-        self.assertTrue(out.attachments[0].data.startswith(b"%PDF"))
+        self.assertTrue(out.media[0].data.startswith(b"%PDF"))
         doc.replace_text("Second", "Second paragraph, now longer")
         out = await doc.changed_pages()
         self.assertIn("after your edits: page 1 of 1", out.text)
-        self.assertIn("Second paragraph, now longer", render.page_texts(out.attachments[0].data)[0])
+        self.assertIn("Second paragraph, now longer", render.page_texts(out.media[0].data)[0])
 
 
 class AnswerTests(unittest.IsolatedAsyncioTestCase):
@@ -599,7 +599,7 @@ class AnswerTests(unittest.IsolatedAsyncioTestCase):
             return "Done, swapped it", "claude", "claude-x"
 
         cog.agent = SimpleNamespace(run=run)
-        cog._read_files = AsyncMock(return_value=Files(editable=[txt]))
+        cog._read_files = AsyncMock(return_value=SimpleNamespace(files=Files(editable=[txt]), counts={"pdf": 0}))
         cog._system_prompt = Mock(return_value="system")
         message = MagicMock()
         message.author.display_name = "Bob"

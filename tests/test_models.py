@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 from xiap import config
 from xiap.cogs.chat import ChatCog
 from xiap.cogs.models import ModelsCog
-from xiap.llm import Agent
+from xiap.llm import PDF, WEB_SEARCH, Agent, Attachment, Tool, ToolResult
 
 
 class ModelTests(unittest.IsolatedAsyncioTestCase):
@@ -171,6 +171,30 @@ class ModelTests(unittest.IsolatedAsyncioTestCase):
         result = await self.agent.run("system", "prompt", [], pick="gemini:")
         self.assertEqual(result, ("Hi", "gemini", "gemini-3.8-flash-high"))
         self.assertEqual(self.agent._bridge_request.call_args.args[0]["model"], "gemini")
+
+    async def test_bridge_requests_ask_for_web_search(self):
+        tool = Tool("get_message", "", {}, AsyncMock(return_value=ToolResult("the message")))
+        self.agent._bridge_request = AsyncMock(return_value={"content": [{"type": "text", "text": "Hi"}]})
+        await self.agent.run("system", "prompt", [tool])
+        self.assertEqual(
+            [t["name"] for t in self.agent._bridge_request.call_args.args[0]["tools"]],
+            ["get_message", "web_search"],
+        )
+        await self.agent.run("system", "prompt", [])
+        self.assertEqual(self.agent._bridge_request.call_args.args[0]["tools"], [WEB_SEARCH])
+        self.assertNotIn("tool_choice", self.agent._bridge_request.call_args.args[0])
+
+    async def test_files_from_a_tool_go_back_in_its_tool_result(self):
+        tool = Tool("get_message", "", {}, AsyncMock(return_value=ToolResult("the message", [Attachment(PDF, b"%PDF", "plan.pdf")])))
+        self.agent._bridge_request = AsyncMock(side_effect=[
+            {"content": [{"type": "tool_use", "id": "t1", "name": "get_message", "input": {}}]},
+            {"content": [{"type": "text", "text": "done"}], "model": "claude-opus-5-5"},
+        ])
+        await self.agent.run("system", "prompt", [tool])
+        result = self.agent._bridge_request.call_args.args[0]["messages"][-1]["content"][0]
+        self.assertEqual(result["content"][0]["type"], "document")
+        self.assertEqual(result["content"][0]["title"], "plan.pdf")
+        self.assertEqual(result["content"][1], {"type": "text", "text": "the message"})
 
     def test_shared_primary_can_be_configured_as_claude(self):
         with patch.object(config, "CHAT_PROVIDER", "claude"):

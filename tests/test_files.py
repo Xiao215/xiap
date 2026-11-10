@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import discord
 from PIL import Image
 
-from xiap.cogs.chat import DOCX, ChatCog, FileReader, _embed_images, _to_png
+from xiap.cogs.chat import DOCX, ChatCog, FileReader, Files, _embed_images, _to_png
 from xiap.editing import WordFile
 
 
@@ -103,16 +103,43 @@ class FileReaderTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("cat-vibing-gif-123, linked by Bob", reader.files.labels[1])
         self.assertIn("one still frame", reader.files.labels[1])
 
-    async def test_recent_messages_only_add_images_and_never_report_skips(self):
+    async def test_recent_messages_add_every_readable_file_and_never_report_skips(self):
         reader = FileReader(Mock())
         old = message("Xiao", attachments=[
             attachment("image.png", "image/png", png()),
+            attachment("plan.pdf", "application/pdf", b"%PDF-1.7"),
             attachment("notes.txt", "text/plain", b"hi"),
+            attachment("trip.docx", DOCX, REPORT),
             attachment("big.png", "image/png", b"x" * 50 * 1024 * 1024),
+            attachment("song.mp3", "audio/mpeg", b"ID3"),
         ])
-        await reader.read(old, "earlier in the chat", images_only=True)
-        self.assertEqual(reader.files.labels, ["image.png, attached by Xiao earlier in the chat"])
-        self.assertEqual((reader.files.texts, reader.files.skipped), ([], []))
+        await reader.read(old, "earlier in the chat", quiet=True)
+        self.assertEqual(reader.files.labels, [
+            "image.png, attached by Xiao earlier in the chat",
+            "plan.pdf, attached by Xiao earlier in the chat",
+        ])
+        self.assertEqual(len(reader.files.texts), 2)
+        self.assertEqual(reader.files.skipped, [])
+
+    async def test_read_into_adds_only_files_not_taken_yet(self):
+        with patch("xiap.config.CHAT_MAX_PDFS", 1):
+            reader = FileReader(Mock())
+        ping = message("Will", attachments=[attachment("ping.pdf", "application/pdf", b"%PDF-1")], id=1)
+        old = message("Amy", attachments=[
+            attachment("a.png", "image/png", png()),
+            attachment("plan.pdf", "application/pdf", b"%PDF-2"),
+        ], id=2)
+        await reader.read(ping, "in the message that pinged you")
+        await reader.read(old, "earlier in the chat", quiet=True)
+        self.assertEqual([a.filename for a in reader.files.media], ["ping.pdf", "a.png"])
+
+        later = Files()
+        await reader.read_into(later, old, "in message 2")
+        self.assertEqual((later.media, later.skipped), ([], ["plan.pdf"]))  # PDF limit already used
+        reader.counts["pdf"] = 0
+        await reader.read_into(later, old, "in message 2")
+        self.assertEqual([a.filename for a in later.media], ["plan.pdf"])
+        self.assertEqual(len(reader.files.media), 2)
 
     async def test_image_cap_skips_the_rest(self):
         with patch("xiap.config.CHAT_MAX_IMAGES", 1):
@@ -146,13 +173,14 @@ class DocxTests(unittest.IsolatedAsyncioTestCase):
         reader = FileReader(Mock())
         ping = message("Bob", attachments=[
             attachment("notes.txt", "text/plain", b"hi"),
-            attachment("notes.txt", "text/plain", b"there"),
             attachment("old.txt", "text/plain", b"caf\xe9"),  # Latin-1: shown, but not editable
         ])
+        replied = message("Bob", attachments=[attachment("notes.txt", "text/plain", b"there")], id=2)
         await reader.read(ping, "in the message that pinged you")
+        await reader.read(replied, "in the message being replied to")
         self.assertEqual([f.name for f in reader.files.editable], ["notes.txt", "notes (2).txt"])
         self.assertEqual(len(reader.files.texts), 3)
-        self.assertIn("=== notes (2).txt (attached by Bob) ===\nthere", reader.files.texts[1])
+        self.assertIn("=== notes (2).txt (attached by Bob) ===\nthere", reader.files.texts[2])
 
 
 class ReadFilesTests(unittest.IsolatedAsyncioTestCase):
@@ -164,8 +192,8 @@ class ReadFilesTests(unittest.IsolatedAsyncioTestCase):
         ctx = SimpleNamespace(limit=30, recent=AsyncMock(return_value=[older, newer]))
         ping = message("C", attachments=[attachment("ping.png", "image/png", png())], id=12)
         ping.content = "what's this"
-        files = await cog._read_files(ctx, ping, None)
-        self.assertEqual([a.filename for a in files.media], ["ping.png", "new.png", "old.png"])
+        reader = await cog._read_files(ctx, ping, None)
+        self.assertEqual([a.filename for a in reader.files.media], ["ping.png", "new.png", "old.png"])
 
     async def test_waits_for_embed_on_pasted_link(self):
         cog = ChatCog(Mock())
@@ -177,9 +205,9 @@ class ReadFilesTests(unittest.IsolatedAsyncioTestCase):
         ping.channel = SimpleNamespace(fetch_message=AsyncMock(return_value=refetched))
         with patch("xiap.cogs.chat.EMBED_WAIT", 0), \
                 patch.object(FileReader, "_download", AsyncMock(return_value=(png(), "image/png"))):
-            files = await cog._read_files(ctx, ping, None)
+            reader = await cog._read_files(ctx, ping, None)
         ping.channel.fetch_message.assert_awaited_once_with(12)
-        self.assertEqual([a.filename for a in files.media], ["IMG_8081.jpg"])
+        self.assertEqual([a.filename for a in reader.files.media], ["IMG_8081.jpg"])
 
 
 if __name__ == "__main__":

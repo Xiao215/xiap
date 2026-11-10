@@ -45,9 +45,11 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "")  # e.g. gemini-3.8-flash-high; empt
 # before the bot gives up on it and fails over to the next one.
 CHAT_TIMEOUT = int(os.getenv("CHAT_TIMEOUT", "90"))
 
-# Images on the pinging message, the one it replies to, then the last
-# CHAT_BASE_CONTEXT messages (attached or embedded from a link, like Tenor GIFs)
-# are shown to the model, up to this many, each at most CHAT_IMAGE_MAX_MB.
+# Files on the pinging message, the one it replies to, then the last
+# CHAT_BASE_CONTEXT messages (newest first) are shown to the model, and older
+# ones when it fetches their message with get_message — all within the limits
+# below, which count per ping. Images (attached or embedded from a link, like
+# Tenor GIFs): up to this many, each at most CHAT_IMAGE_MAX_MB.
 CHAT_MAX_IMAGES = int(os.getenv("CHAT_MAX_IMAGES", "4"))
 CHAT_IMAGE_MAX_MB = float(os.getenv("CHAT_IMAGE_MAX_MB", "5"))
 # PDFs go to a model that can read them (Claude or Gemini; Cohere can't, so

@@ -7,14 +7,17 @@ rounds, at which point tools are switched off so it has to answer with what it
 has).
 
 Claude and Gemini both go through the configured cli-bridge server (Anthropic
-Messages format), which runs them on the `claude` and `agy` CLIs. Cohere
+Messages format), which runs them on the `claude` and `agy` CLIs; every
+request there also asks for web search, which the CLI runs itself. Cohere
 round-robins across its configured API keys. All configured providers are
 available to everyone. Cohere can't read PDFs, so
 when one is attached, providers that can read it go first. If a provider fails
 outright, or takes longer than its deadline, the whole run restarts on the
 next. Tools only read, or (file edits) change a workspace that's reset before
-each provider starts, so re-running them on failover is harmless. A
-workspace can also ask the model to check its work before it answers.
+each provider starts, so re-running them on failover is harmless. A tool can
+hand back images and PDFs along with its text (get_message does, for the files
+on the messages it fetches; render, for a document's pages). A workspace can
+also ask the model to check its work before it answers.
 """
 
 import asyncio
@@ -49,6 +52,9 @@ BRIDGE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp", PDF}
 # Providers served by cli-bridge; they all read images and PDFs.
 BRIDGE_PROVIDERS = {"claude", "gemini"}
 PDF_PROVIDERS = BRIDGE_PROVIDERS
+# Anthropic's server tool; cli-bridge answers it with the CLI's own web search
+# and fetch, for that request only.
+WEB_SEARCH = {"type": "web_search_20250305", "name": "web_search"}
 
 
 @dataclass
@@ -64,12 +70,11 @@ class Attachment:
 
 
 @dataclass
-class Output:
-    """Text for the model, and images or PDFs to show it alongside (e.g. a
-    document's pages). Models that can't see them are told so instead."""
+class ToolResult:
+    """What a tool hands back: text, plus any images or PDFs to show the model."""
 
     text: str
-    attachments: list[Attachment] = field(default_factory=list)
+    media: list[Attachment] = field(default_factory=list)
 
 
 @dataclass
@@ -77,7 +82,8 @@ class Tool:
     name: str
     description: str
     parameters: dict  # JSON schema for the arguments object
-    run: Callable[..., Awaitable[str | Output]]
+    # A plain str is cut to MAX_TOOL_RESULT_CHARS; a ToolResult keeps its own size in check.
+    run: Callable[..., Awaitable[str | ToolResult]]
 
 
 class Workspace(Protocol):
@@ -86,7 +92,7 @@ class Workspace(Protocol):
     def reset(self) -> None:
         """Undo every change: called before each provider's attempt."""
 
-    async def review(self) -> Output | None:
+    async def review(self) -> ToolResult | None:
         """Called when the model is about to answer: a note asking it to check
         its changes (it answers again afterwards), or None to let it answer."""
 
@@ -120,6 +126,26 @@ def _bridge_headers() -> dict[str, str]:
     return headers
 
 
+def truncate(text: str) -> str:
+    """Tool output cut to MAX_TOOL_RESULT_CHARS so one call can't blow up the prompt."""
+    if len(text) > MAX_TOOL_RESULT_CHARS:
+        return text[:MAX_TOOL_RESULT_CHARS] + "\n…(truncated)"
+    return text
+
+
+def _media_blocks(attachments: list[Attachment]) -> list[dict]:
+    """Anthropic content blocks for the images and PDFs cli-bridge takes."""
+    return [
+        {
+            "type": "document" if a.mime == PDF else "image",
+            "source": {"type": "base64", "media_type": a.mime, "data": a.b64()},
+            **({"title": a.filename} if a.mime == PDF and a.filename else {}),
+        }
+        for a in attachments
+        if a.mime in BRIDGE_TYPES
+    ]
+
+
 def _attachment_note(attachments: list[Attachment], supported: set[str]) -> str:
     """Tell the model about attached files it won't be able to see."""
     skipped = [a for a in attachments if a.mime not in supported]
@@ -132,19 +158,6 @@ def _attachment_note(attachments: list[Attachment], supported: set[str]) -> str:
         f"\n\n({what} attached couldn't be shown to you — don't pretend to see them. If they matter "
         "to the question, say you can't read them.)"
     )
-
-
-def _media(attachments: list[Attachment]) -> list[dict]:
-    """Anthropic-format content blocks for the images and PDFs cli-bridge takes."""
-    return [
-        {
-            "type": "document" if a.mime == PDF else "image",
-            "source": {"type": "base64", "media_type": a.mime, "data": a.b64()},
-            **({"title": a.filename} if a.mime == PDF and a.filename else {}),
-        }
-        for a in attachments
-        if a.mime in BRIDGE_TYPES
-    ]
 
 
 class KeyRing:
@@ -162,10 +175,10 @@ class KeyRing:
         return ordered
 
 
-async def _run_tool(tools: dict[str, Tool], name: str, args: dict) -> Output:
+async def _run_tool(tools: dict[str, Tool], name: str, args: dict) -> ToolResult:
     tool = tools.get(name)
     if tool is None:
-        return Output(f"Error: unknown tool {name!r}")
+        return ToolResult(f"Error: unknown tool {name!r}")
     log.info("Tool call: %s(%s)", name, json.dumps(args, ensure_ascii=False))
     try:
         result = await tool.run(**args)
@@ -173,9 +186,9 @@ async def _run_tool(tools: dict[str, Tool], name: str, args: dict) -> Output:
         log.warning("Tool %s failed: %s", name, e)
         result = f"Error: {e}"
     if isinstance(result, str):
-        result = Output(result)
-    if len(result.text) > MAX_TOOL_RESULT_CHARS:
-        result.text = result.text[:MAX_TOOL_RESULT_CHARS] + "\n…(truncated)"
+        result = ToolResult(truncate(result))
+    if result.media:
+        log.info("Tool %s shows %s", name, ", ".join(a.filename or a.mime for a in result.media))
     return result
 
 
@@ -364,7 +377,7 @@ class Agent:
                 if workspace is not None and round_ < rounds and (note := await workspace.review()):
                     messages += [
                         {"role": "assistant", "content": text},
-                        {"role": "user", "content": note.text + _attachment_note(note.attachments, set())},
+                        {"role": "user", "content": note.text + _attachment_note(note.media, set())},
                     ]
                     continue
                 return text, model
@@ -384,7 +397,7 @@ class Agent:
             for call in msg.tool_calls:
                 args = json.loads(call.function.arguments or "{}")
                 result = await _run_tool(tools, call.function.name, args)
-                text = result.text + _attachment_note(result.attachments, set())
+                text = result.text + _attachment_note(result.media, set())
                 messages.append({"role": "tool", "tool_call_id": call.id, "content": json.dumps({"result": text})})
         raise RuntimeError("no answer after tool rounds")
 
@@ -412,7 +425,7 @@ class Agent:
     ) -> tuple[str, str]:
         """`default` is sent when no model is chosen; empty = the server's default."""
         model = model or default
-        content = _media(attachments)
+        content = _media_blocks(attachments)
         content.append({"type": "text", "text": prompt + _attachment_note(attachments, BRIDGE_TYPES)})
         messages: list[dict] = [{"role": "user", "content": content}]
         specs = [
@@ -420,13 +433,16 @@ class Agent:
             for t in tools.values()
         ]
         for round_ in range(rounds + 1):
-            body: dict[str, Any] = {"max_tokens": 4096, "system": system, "messages": messages}
+            body: dict[str, Any] = {
+                "max_tokens": 4096,
+                "system": system,
+                "messages": messages,
+                "tools": [*specs, WEB_SEARCH],
+            }
             if model:
                 body["model"] = model
-            if specs:
-                body["tools"] = specs
-                if round_ == rounds:  # out of rounds: answer now
-                    body["tool_choice"] = {"type": "none"}
+            if specs and round_ == rounds:  # out of rounds: answer now
+                body["tool_choice"] = {"type": "none"}
             data = await self._bridge_request(body)
             blocks = data["content"]
             calls = [b for b in blocks if b["type"] == "tool_use"]
@@ -435,10 +451,10 @@ class Agent:
                 if not text.strip():
                     raise RuntimeError("empty response")
                 if workspace is not None and round_ < rounds and (note := await workspace.review()):
-                    text = note.text + _attachment_note(note.attachments, BRIDGE_TYPES)
+                    text = note.text + _attachment_note(note.media, BRIDGE_TYPES)
                     messages += [
                         {"role": "assistant", "content": blocks},
-                        {"role": "user", "content": [{"type": "text", "text": text}, *_media(note.attachments)]},
+                        {"role": "user", "content": [*_media_blocks(note.media), {"type": "text", "text": text}]},
                     ]
                     continue
                 # The server reports the full id ("claude-opus-5-5") even when
@@ -449,9 +465,11 @@ class Agent:
             results = []
             for call in calls:
                 result = await _run_tool(tools, call["name"], call.get("input") or {})
-                text = result.text + _attachment_note(result.attachments, BRIDGE_TYPES)
-                # Pages a tool shows (a rendered document) go inside its result.
-                content = [{"type": "text", "text": text}, *_media(result.attachments)] if result.attachments else text
-                results.append({"type": "tool_result", "tool_use_id": call["id"], "content": content})
+                text = result.text + _attachment_note(result.media, BRIDGE_TYPES)
+                results.append({
+                    "type": "tool_result",
+                    "tool_use_id": call["id"],
+                    "content": [*_media_blocks(result.media), {"type": "text", "text": text}] if result.media else text,
+                })
             messages.append({"role": "user", "content": results})
         raise RuntimeError("no answer after tool rounds")

@@ -38,7 +38,7 @@ from contextlib import contextmanager
 from lxml import etree
 
 from xiap import config, render
-from xiap.llm import PDF, Attachment, Output, Tool
+from xiap.llm import PDF, Attachment, Tool, ToolResult
 
 log = logging.getLogger(__name__)
 
@@ -1253,26 +1253,26 @@ class WordFile:
 
     # --- seeing the pages -------------------------------------------------------------
 
-    def _pages(self, pdf: bytes, pages: list[int], total: int, why: str = "") -> Output:
+    def _pages(self, pdf: bytes, pages: list[int], total: int, why: str = "") -> ToolResult:
         more = f" Ask for pages='{pages[-1] + 1}-{min(total, pages[-1] + config.CHAT_RENDER_PAGES)}' to see more." if pages[-1] < total else ""
         shown = render.spans(pages)
-        return Output(
+        return ToolResult(
             f"{self.name} as it is now{why}: page{'s' * (len(pages) > 1)} {shown} of {total}, laid out "
             f"by LibreOffice (very close to Word, not identical).{more}",
             [Attachment(PDF, render.only(pdf, pages), f"{os.path.splitext(self.name)[0]} p{shown}.pdf")],
         )
 
-    async def render(self, pages: str | None = None) -> Output:
+    async def render(self, pages: str | None = None) -> ToolResult:
         pdf = await render.to_pdf(await asyncio.to_thread(self._pack))
         total = len(render.page_texts(pdf))
         return self._pages(pdf, render.pick(pages, total, config.CHAT_RENDER_PAGES), total)
 
-    async def changed_pages(self) -> Output | None:
+    async def changed_pages(self) -> ToolResult | None:
         """The pages the edits landed on (found by their text), for the final check."""
         try:
             pdf = await render.to_pdf(await asyncio.to_thread(self._pack))
         except render.RenderError as e:
-            return Output(f"(Couldn't lay {self.name} out to show you the pages: {e}.)")
+            return ToolResult(f"(Couldn't lay {self.name} out to show you the pages: {e}.)")
         texts = [re.sub(r"\s+", "", t) for t in await asyncio.to_thread(render.page_texts, pdf)]
         found = []
         for bid, line in self._lines():
@@ -1356,12 +1356,12 @@ class EditSession:
         """Whether the model can be shown pages: a Word document, and LibreOffice to lay it out."""
         return any(isinstance(f, WordFile) for f in self.files.values()) and render.soffice() is not None
 
-    async def review(self) -> Output | None:
+    async def review(self) -> ToolResult | None:
         """The diff to check, and the pages the edits landed on, if anything
         changed since the last review."""
         if not any(f.version > f.reviewed for f in self.files.values()):
             return None
-        diffs, notes, attachments = [], [], []
+        diffs, notes, media = [], [], []
         for f in self.files.values():
             fresh = f.version > f.reviewed
             f.reviewed = f.version
@@ -1370,17 +1370,17 @@ class EditSession:
             diffs.append(f"=== {f.name} ===\n{f.diff() or '(no change in the end)'}")
             if fresh and isinstance(f, WordFile) and self.visual and (pages := await f.changed_pages()):
                 notes.append(pages.text)
-                attachments += pages.attachments
+                media += pages.media
         text = "\n\n".join(diffs)
         if len(text) > REVIEW_CHARS:
             text = text[:REVIEW_CHARS] + "\n…(cut off; view_file shows the files in full)"
-        if attachments:
+        if media:
             notes.append(
                 "Look at these pages too: nothing should run off the page or overlap, and spacing, "
                 "sizes and alignment should look even and deliberate."
             )
         pages = "\n" + "\n".join(notes) + "\n" if notes else ""
-        return Output(REVIEW.format(diffs=text, pages=pages), attachments)
+        return ToolResult(REVIEW.format(diffs=text, pages=pages), media)
 
     async def outputs(self) -> tuple[list[tuple[str, bytes]], list[str]]:
         """(edited name, data) for every edited file, and names of ones that failed to save."""
@@ -1675,7 +1675,7 @@ class EditSession:
         if not self.visual:
             return tools
 
-        async def render_pages(file: str, pages: str | None = None) -> Output:
+        async def render_pages(file: str, pages: str | None = None) -> ToolResult:
             return await self._word(file).render(pages or None)
 
         tools.append(Tool(
