@@ -7,7 +7,8 @@ rounds, at which point tools are switched off so it has to answer with what it
 has).
 
 Claude and Gemini both go through the configured cli-bridge server (Anthropic
-Messages format), which runs them on the `claude` and `agy` CLIs. Cohere
+Messages format), which runs them on the `claude` and `agy` CLIs; every
+request there also asks for web search, which the CLI runs itself. Cohere
 round-robins across its configured API keys. All configured providers are
 available to everyone. Cohere can't read PDFs, so
 when one is attached, providers that can read it go first. If a provider fails
@@ -49,6 +50,9 @@ BRIDGE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp", PDF}
 # Providers served by cli-bridge; they all read images and PDFs.
 BRIDGE_PROVIDERS = {"claude", "gemini"}
 PDF_PROVIDERS = BRIDGE_PROVIDERS
+# Anthropic's server tool; cli-bridge answers it with the CLI's own web search
+# and fetch, for that request only.
+WEB_SEARCH = {"type": "web_search_20250305", "name": "web_search"}
 
 
 @dataclass
@@ -388,13 +392,16 @@ class Agent:
             for t in tools.values()
         ]
         for round_ in range(config.CHAT_MAX_TOOL_ROUNDS + 1):
-            body: dict[str, Any] = {"max_tokens": 4096, "system": system, "messages": messages}
+            body: dict[str, Any] = {
+                "max_tokens": 4096,
+                "system": system,
+                "messages": messages,
+                "tools": [*specs, WEB_SEARCH],
+            }
             if model:
                 body["model"] = model
-            if specs:
-                body["tools"] = specs
-                if round_ == config.CHAT_MAX_TOOL_ROUNDS:  # out of rounds: answer now
-                    body["tool_choice"] = {"type": "none"}
+            if specs and round_ == config.CHAT_MAX_TOOL_ROUNDS:  # out of rounds: answer now
+                body["tool_choice"] = {"type": "none"}
             data = await self._bridge_request(body)
             blocks = data["content"]
             calls = [b for b in blocks if b["type"] == "tool_use"]

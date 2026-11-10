@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 from xiap import config
 from xiap.cogs.chat import ChatCog
 from xiap.cogs.models import ModelsCog
-from xiap.llm import PDF, Agent, Attachment, Tool, ToolResult
+from xiap.llm import PDF, WEB_SEARCH, Agent, Attachment, Tool, ToolResult
 
 
 class ModelTests(unittest.IsolatedAsyncioTestCase):
@@ -171,6 +171,18 @@ class ModelTests(unittest.IsolatedAsyncioTestCase):
         result = await self.agent.run("system", "prompt", [], pick="gemini:")
         self.assertEqual(result, ("Hi", "gemini", "gemini-3.8-flash-high"))
         self.assertEqual(self.agent._bridge_request.call_args.args[0]["model"], "gemini")
+
+    async def test_bridge_requests_ask_for_web_search(self):
+        tool = Tool("get_message", "", {}, AsyncMock(return_value=ToolResult("the message")))
+        self.agent._bridge_request = AsyncMock(return_value={"content": [{"type": "text", "text": "Hi"}]})
+        await self.agent.run("system", "prompt", [tool])
+        self.assertEqual(
+            [t["name"] for t in self.agent._bridge_request.call_args.args[0]["tools"]],
+            ["get_message", "web_search"],
+        )
+        await self.agent.run("system", "prompt", [])
+        self.assertEqual(self.agent._bridge_request.call_args.args[0]["tools"], [WEB_SEARCH])
+        self.assertNotIn("tool_choice", self.agent._bridge_request.call_args.args[0])
 
     async def test_files_from_a_tool_go_back_in_its_tool_result(self):
         tool = Tool("get_message", "", {}, AsyncMock(return_value=ToolResult("the message", [Attachment(PDF, b"%PDF", "plan.pdf")])))
