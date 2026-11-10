@@ -12,7 +12,9 @@ round-robins across its configured API keys. All configured providers are
 available to everyone. Cohere can't read PDFs, so
 when one is attached, providers that can read it go first. If a provider fails
 outright, or takes longer than its deadline, the whole run restarts on the
-next. Tools are read-only, so re-running them on failover is harmless.
+next. Tools only read, or (file edits) change a workspace that's reset before
+each provider starts, so re-running them on failover is harmless. A
+workspace can also ask the model to check its work before it answers.
 """
 
 import asyncio
@@ -22,8 +24,8 @@ import json
 import logging
 import time
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, Protocol
 
 import aiohttp
 import cohere
@@ -62,11 +64,31 @@ class Attachment:
 
 
 @dataclass
+class Output:
+    """Text for the model, and images or PDFs to show it alongside (e.g. a
+    document's pages). Models that can't see them are told so instead."""
+
+    text: str
+    attachments: list[Attachment] = field(default_factory=list)
+
+
+@dataclass
 class Tool:
     name: str
     description: str
     parameters: dict  # JSON schema for the arguments object
-    run: Callable[..., Awaitable[str]]
+    run: Callable[..., Awaitable[str | Output]]
+
+
+class Workspace(Protocol):
+    """What tools change during a run (e.g. files being edited)."""
+
+    def reset(self) -> None:
+        """Undo every change: called before each provider's attempt."""
+
+    async def review(self) -> Output | None:
+        """Called when the model is about to answer: a note asking it to check
+        its changes (it answers again afterwards), or None to let it answer."""
 
 
 def reads_pdfs(label: str) -> bool:
@@ -112,6 +134,19 @@ def _attachment_note(attachments: list[Attachment], supported: set[str]) -> str:
     )
 
 
+def _media(attachments: list[Attachment]) -> list[dict]:
+    """Anthropic-format content blocks for the images and PDFs cli-bridge takes."""
+    return [
+        {
+            "type": "document" if a.mime == PDF else "image",
+            "source": {"type": "base64", "media_type": a.mime, "data": a.b64()},
+            **({"title": a.filename} if a.mime == PDF and a.filename else {}),
+        }
+        for a in attachments
+        if a.mime in BRIDGE_TYPES
+    ]
+
+
 class KeyRing:
     """Round-robin over any number of keys/clients, starting each request one
     position later than the last so load spreads evenly."""
@@ -127,18 +162,20 @@ class KeyRing:
         return ordered
 
 
-async def _run_tool(tools: dict[str, Tool], name: str, args: dict) -> str:
+async def _run_tool(tools: dict[str, Tool], name: str, args: dict) -> Output:
     tool = tools.get(name)
     if tool is None:
-        return f"Error: unknown tool {name!r}"
+        return Output(f"Error: unknown tool {name!r}")
     log.info("Tool call: %s(%s)", name, json.dumps(args, ensure_ascii=False))
     try:
         result = await tool.run(**args)
     except Exception as e:  # noqa: BLE001 — report tool errors back to the model
         log.warning("Tool %s failed: %s", name, e)
         result = f"Error: {e}"
-    if len(result) > MAX_TOOL_RESULT_CHARS:
-        result = result[:MAX_TOOL_RESULT_CHARS] + "\n…(truncated)"
+    if isinstance(result, str):
+        result = Output(result)
+    if len(result.text) > MAX_TOOL_RESULT_CHARS:
+        result.text = result.text[:MAX_TOOL_RESULT_CHARS] + "\n…(truncated)"
     return result
 
 
@@ -245,21 +282,34 @@ class Agent:
         tools: list[Tool],
         attachments: Sequence[Attachment] = (),
         pick: str | None = None,
+        workspace: Workspace | None = None,
+        rounds: int | None = None,
+        visual: bool = False,
     ) -> tuple[str, str, str] | None:
         """Run the agent loop; returns (answer, "provider:model" from the chain,
         the model id that actually answered) or None if every provider failed.
-        `pick` is the user's chosen "provider:model"."""
+        `pick` is the user's chosen "provider:model"; `rounds` caps tool rounds
+        (default CHAT_MAX_TOOL_ROUNDS). With a workspace, each provider gets
+        CHAT_EDIT_TIMEOUT; `visual` (tools that show pages) puts the providers
+        that can see them first, as an attached PDF does."""
         by_name = {t.name: t for t in tools}
         pdf = any(a.mime == PDF for a in attachments)
-        for provider, model in self.chain(pick=pick, pdf=pdf):
+        rounds = config.CHAT_MAX_TOOL_ROUNDS if rounds is None else rounds
+        for provider, model in self.chain(pick=pick, pdf=pdf or visual):
             label = f"{provider}:{model}" if model else provider
             # A slow model (thinking, preview, a stuck connection) shouldn't
             # leave the chat staring at "typing…" — give up and fail over.
             deadline = config.CLI_BRIDGE_TIMEOUT if provider in BRIDGE_PROVIDERS else config.CHAT_TIMEOUT
+            if workspace is not None:  # editing takes more rounds, and pages take a while to lay out
+                deadline = max(deadline, config.CHAT_EDIT_TIMEOUT)
             started = time.monotonic()
+            if workspace is not None:
+                workspace.reset()  # drop a failed provider's half-done changes
             try:
                 async with asyncio.timeout(deadline):
-                    answer, used = await self._runners[provider](system, prompt, by_name, list(attachments), model)
+                    answer, used = await self._runners[provider](
+                        system, prompt, by_name, list(attachments), model, rounds=rounds, workspace=workspace
+                    )
                 log.info("Answered by %s (%s) in %.1fs", label, used, time.monotonic() - started)
                 return answer, label, used
             except Exception as e:  # noqa: BLE001 — fall through to the next provider
@@ -279,7 +329,14 @@ class Agent:
         raise RuntimeError(f"all Cohere keys failed: {last_error}")
 
     async def _run_cohere(
-        self, system: str, prompt: str, tools: dict[str, Tool], attachments: list[Attachment], model: str
+        self,
+        system: str,
+        prompt: str,
+        tools: dict[str, Tool],
+        attachments: list[Attachment],
+        model: str,
+        rounds: int,
+        workspace: Workspace | None = None,
     ) -> tuple[str, str]:
         messages: list[dict] = [
             {"role": "system", "content": system},
@@ -292,11 +349,11 @@ class Agent:
             }
             for t in tools.values()
         ]
-        for round_ in range(config.CHAT_MAX_TOOL_ROUNDS + 1):
+        for round_ in range(rounds + 1):
             kwargs: dict[str, Any] = {"messages": messages}
             if specs:
                 kwargs["tools"] = specs
-                if round_ == config.CHAT_MAX_TOOL_ROUNDS:  # out of rounds: answer now
+                if round_ == rounds:  # out of rounds: answer now
                     kwargs["tool_choice"] = "NONE"
             msg = await self._cohere_request(model, **kwargs)
             if not msg.tool_calls:
@@ -304,6 +361,12 @@ class Agent:
                 text = "".join(c.text for c in msg.content or [] if getattr(c, "type", "text") == "text")
                 if not text.strip():
                     raise RuntimeError("empty response")
+                if workspace is not None and round_ < rounds and (note := await workspace.review()):
+                    messages += [
+                        {"role": "assistant", "content": text},
+                        {"role": "user", "content": note.text + _attachment_note(note.attachments, set())},
+                    ]
+                    continue
                 return text, model
 
             messages.append({
@@ -321,7 +384,8 @@ class Agent:
             for call in msg.tool_calls:
                 args = json.loads(call.function.arguments or "{}")
                 result = await _run_tool(tools, call.function.name, args)
-                messages.append({"role": "tool", "tool_call_id": call.id, "content": json.dumps({"result": result})})
+                text = result.text + _attachment_note(result.attachments, set())
+                messages.append({"role": "tool", "tool_call_id": call.id, "content": json.dumps({"result": text})})
         raise RuntimeError("no answer after tool rounds")
 
     # --- Claude and Gemini (via the configured cli-bridge server) -------------
@@ -342,32 +406,26 @@ class Agent:
         tools: dict[str, Tool],
         attachments: list[Attachment],
         model: str,
+        rounds: int,
+        workspace: Workspace | None = None,
         default: str = "",
     ) -> tuple[str, str]:
         """`default` is sent when no model is chosen; empty = the server's default."""
         model = model or default
-        content: list[dict] = [
-            {
-                "type": "document" if a.mime == PDF else "image",
-                "source": {"type": "base64", "media_type": a.mime, "data": a.b64()},
-                **({"title": a.filename} if a.mime == PDF and a.filename else {}),
-            }
-            for a in attachments
-            if a.mime in BRIDGE_TYPES
-        ]
+        content = _media(attachments)
         content.append({"type": "text", "text": prompt + _attachment_note(attachments, BRIDGE_TYPES)})
         messages: list[dict] = [{"role": "user", "content": content}]
         specs = [
             {"name": t.name, "description": t.description, "input_schema": t.parameters}
             for t in tools.values()
         ]
-        for round_ in range(config.CHAT_MAX_TOOL_ROUNDS + 1):
+        for round_ in range(rounds + 1):
             body: dict[str, Any] = {"max_tokens": 4096, "system": system, "messages": messages}
             if model:
                 body["model"] = model
             if specs:
                 body["tools"] = specs
-                if round_ == config.CHAT_MAX_TOOL_ROUNDS:  # out of rounds: answer now
+                if round_ == rounds:  # out of rounds: answer now
                     body["tool_choice"] = {"type": "none"}
             data = await self._bridge_request(body)
             blocks = data["content"]
@@ -376,6 +434,13 @@ class Agent:
                 text = "".join(b.get("text", "") for b in blocks if b["type"] == "text")
                 if not text.strip():
                     raise RuntimeError("empty response")
+                if workspace is not None and round_ < rounds and (note := await workspace.review()):
+                    text = note.text + _attachment_note(note.attachments, BRIDGE_TYPES)
+                    messages += [
+                        {"role": "assistant", "content": blocks},
+                        {"role": "user", "content": [{"type": "text", "text": text}, *_media(note.attachments)]},
+                    ]
+                    continue
                 # The server reports the full id ("claude-opus-5-5") even when
                 # we asked for an alias like "opus" or the server default.
                 return text, data.get("model") or model
@@ -384,6 +449,9 @@ class Agent:
             results = []
             for call in calls:
                 result = await _run_tool(tools, call["name"], call.get("input") or {})
-                results.append({"type": "tool_result", "tool_use_id": call["id"], "content": result})
+                text = result.text + _attachment_note(result.attachments, BRIDGE_TYPES)
+                # Pages a tool shows (a rendered document) go inside its result.
+                content = [{"type": "text", "text": text}, *_media(result.attachments)] if result.attachments else text
+                results.append({"type": "tool_result", "tool_use_id": call["id"], "content": content})
             messages.append({"role": "user", "content": results})
         raise RuntimeError("no answer after tool rounds")

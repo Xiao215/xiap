@@ -5,7 +5,9 @@ gets a small window of recent messages and tools to pull more when it needs
 it: older channel history, or a specific message (by id or link) along with
 the reply chain above it. Files on the pinging message (or the one it replies
 to) are shown to the model too: images and PDFs as-is, text files and Word
-documents pasted into the prompt. Images in the recent messages are shown as well, and so are images
+documents pasted into the prompt. Those text files and Word documents can also
+be edited when asked (xiap.editing); the edited copies are attached to the
+reply. Images in the recent messages are shown as well, and so are images
 Discord embedded from links (pasted image links, Tenor/Giphy GIFs). Everything
 it can read still obeys /context and /optout. Provider
 handling (Claude/Gemini/Cohere for everyone, key rotation,
@@ -18,10 +20,8 @@ import io
 import logging
 import os
 import re
-import zipfile
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
-from xml.etree import ElementTree
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -31,6 +31,7 @@ from PIL import Image
 
 from xiap import config, discord_md
 from xiap.bot import XiapBot
+from xiap.editing import EditSession, TextFile, WordFile
 from xiap.llm import PDF, Agent, Attachment, Tool, reads_pdfs
 from xiap.store import store
 
@@ -54,11 +55,9 @@ MAX_INLINE_BYTES = 14 * MB
 # Text files bigger than this aren't downloaded just to be cut off.
 MAX_TEXT_BYTES = 1 * MB
 # Word documents carry their images and fonts too, so they get more room; only
-# their text is read, and a document.xml bigger than MAX_DOCX_XML is refused.
+# their text is read (xiap.editing refuses a huge document.xml).
 DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 MAX_DOCX_BYTES = 10 * MB
-MAX_DOCX_XML = 20 * MB
-W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 # Image formats every image-reading provider takes; others (GIF, HEIC, BMP…)
 # are converted to PNG first.
 IMAGE_TYPES = {"image/png", "image/jpeg", "image/webp"}
@@ -131,7 +130,9 @@ one message by id or link plus the messages it replies to.
 - If a tool says something is off-limits (history turned off, someone opted out), respect that \
 and don't speculate about the hidden content.
 - Files attached to the message that pinged you (or the one it replies to) are shown to you: \
-images and PDFs directly, text files and Word documents (.docx, text only) pasted in. Images in the recent messages you're shown, \
+images and PDFs directly, text files and Word documents (.docx, as numbered paragraphs and table \
+rows) pasted in. When asked to change one of those text files or Word documents, edit it with \
+your edit tools and the edited copy is attached to your reply. Images in the recent messages you're shown, \
 including ones Discord embedded from a link (`[embedded: …]`), are shown too; the prompt lists \
 which image came from whom. An animated GIF arrives as a grid of a few frames in order (left \
 to right, top to bottom); a Tenor/Giphy GIF only as one still frame. Other files only show up \
@@ -143,6 +144,20 @@ you, briefly explain the relevant ones and mention that `/help` shows the full l
 {features}
 - People chat with you by @mentioning you or replying to your messages.
 """
+
+EDITING = """\
+You can edit these attached files: {names}. Only edit when you're asked to change a file. \
+Make changes with the edit tools, never by pasting the file into chat: the edited copy is \
+attached to your reply automatically, and the original stays as it was.
+Word documents are shown as numbered blocks: [p3] is a paragraph (with its style, if it has \
+one), [t1.r2] a table row with its cells split by " | " (cells are t1.r2.c1, t1.r2.c2, …). The \
+ids don't change as you edit. Pictures and charts show as ⟦image 1: 15.2×8.0 cm⟧. Lines at the \
+top list the document's paragraph styles and anything in it you can't see or edit; if a \
+request needs one of those, say you can't do that part instead of pretending.
+Layout and design count too, not just the words: when asked to tidy, fix or redesign a \
+document, or when your edits could move things around, look at its pages with render (if \
+you have it), fix what's off with the layout tools (a table running off the page, cramped or \
+uneven spacing, mismatched sizes, oversized images, the wrong orientation), then look again."""
 
 
 class ChatContext:
@@ -224,6 +239,8 @@ class ChatContext:
             )
         if files.texts:
             sections.append("Attached text files:\n\n" + "\n\n".join(files.texts))
+        if files.editable:
+            sections.append(EDITING.format(names=", ".join(f.name for f in files.editable)))
         if files.skipped:
             sections.append(
                 f"(You can't see these attached files — too big, too many, or a type you can't "
@@ -342,51 +359,12 @@ def _kind(a: discord.Attachment) -> tuple[str, str]:
     return "other", mime
 
 
-def _text_section(filename: str, author: str, text: str) -> str:
+def _text_section(filename: str, author: str, text: str, *, editable: bool = False) -> str:
     limit = config.CHAT_TEXT_MAX_CHARS
     if len(text) > limit:
-        text = text[:limit] + f"\n…(cut off: only the first {limit:,} of {len(text):,} characters are shown)"
+        more = "; view_file shows the rest" if editable else ""
+        text = text[:limit] + f"\n…(cut off: only the first {limit:,} of {len(text):,} characters are shown{more})"
     return f"=== {filename} (attached by {author}) ===\n{text}\n=== end of {filename} ==="
-
-
-def _docx_text(data: bytes) -> str:
-    """The text of a Word document: one line per paragraph, table rows as
-    cells joined by " | ". Raises on anything that isn't a readable .docx."""
-    with zipfile.ZipFile(io.BytesIO(data)) as z:
-        if z.getinfo("word/document.xml").file_size > MAX_DOCX_XML:
-            raise ValueError("document.xml is too big")
-        xml = z.read("word/document.xml")
-    if b"<!DOCTYPE" in xml[:4096]:  # never in a real .docx; don't let expat expand entities
-        raise ValueError("document.xml has a DTD")
-    body = ElementTree.fromstring(xml).find(f"{W}body")
-    if body is None:
-        raise ValueError("document.xml has no body")
-
-    def paragraph(p: ElementTree.Element) -> str:
-        parts = []
-        for el in p.iter():
-            if el.tag == f"{W}t":
-                parts.append(el.text or "")
-            elif el.tag == f"{W}tab":
-                parts.append("\t")
-            elif el.tag in (f"{W}br", f"{W}cr"):
-                parts.append("\n")
-        return "".join(parts)
-
-    def block(el: ElementTree.Element) -> list[str]:
-        if el.tag == f"{W}p":
-            return [paragraph(el)]
-        if el.tag == f"{W}tbl":
-            return [
-                " | ".join(" ".join(paragraph(p) for p in tc.iter(f"{W}p")).strip() for tc in tr.findall(f"{W}tc"))
-                for tr in el.findall(f"{W}tr")
-            ]
-        if el.tag == f"{W}sdt":  # content control (e.g. a table of contents): read what's inside
-            content = el.find(f"{W}sdtContent")
-            return [line for child in (content if content is not None else []) for line in block(child)]
-        return []
-
-    return "\n".join(line for child in body for line in block(child)).strip()
 
 
 def _embed_images(msg: discord.Message) -> list[tuple[str, str, bool]]:
@@ -437,6 +415,7 @@ class Files:
     labels: list[str] = field(default_factory=list)  # one per media item: what it is, who posted it
     texts: list[str] = field(default_factory=list)  # text files, as prompt sections
     skipped: list[str] = field(default_factory=list)  # names of files it won't get
+    editable: list[TextFile | WordFile] = field(default_factory=list)  # those texts it may edit
 
 
 class FileReader:
@@ -487,16 +466,23 @@ class FileReader:
                 if b"\x00" in data[:8192]:  # binary after all
                     skip(a.filename)
                     continue
-                self.files.texts.append(_text_section(a.filename, who, data.decode("utf-8", "replace")))
+                try:
+                    file = TextFile(self._unique(a.filename), who, data)
+                except UnicodeDecodeError:  # readable, but saving it back would mangle it
+                    self.files.texts.append(_text_section(a.filename, who, data.decode("utf-8", "replace")))
+                else:
+                    self.files.editable.append(file)
+                    self.files.texts.append(_text_section(file.name, who, file.view(), editable=True))
                 self.counts["text"] += 1
             elif kind == "docx":
                 try:
-                    text = await asyncio.to_thread(_docx_text, data)
+                    file = await asyncio.to_thread(WordFile, self._unique(a.filename), who, data)
                 except Exception as e:  # noqa: BLE001 — bad zips and XML raise all sorts
                     log.warning("Couldn't read Word document %s: %s", a.filename, e)
                     skip(a.filename)
                     continue
-                self.files.texts.append(_text_section(a.filename, who, text))
+                self.files.editable.append(file)
+                self.files.texts.append(_text_section(file.name, who, file.view(), editable=True))
                 self.counts["docx"] += 1
             elif kind == "pdf":
                 if not self._add(Attachment(mime, data, a.filename), f"{a.filename}, attached by {who} {where}"):
@@ -511,6 +497,16 @@ class FileReader:
             how = f"linked by {who} {where}" + (" (a GIF, shown as one still frame)" if gifv else "")
             if got is None or not await self._add_image(*got, name, how):
                 skip(name)
+
+    def _unique(self, name: str) -> str:
+        """The name an editable file goes by: two notes.txt become notes.txt and notes (2).txt."""
+        taken = {f.name for f in self.files.editable}
+        stem, ext = os.path.splitext(name)
+        n = 1
+        while name in taken:
+            n += 1
+            name = f"{stem} ({n}){ext}"
+        return name
 
     async def _download(self, url: str, max_bytes: int) -> tuple[bytes, str] | None:
         """(data, mime type) of an image from Discord's media proxy, or None."""
@@ -692,25 +688,46 @@ class ChatCog(commands.Cog):
         ):
             replied = None
         pick = store.get_model_pick(message.author.id)
+        uploads: list[discord.File] = []
         async with message.channel.typing():
             files = await self._read_files(ctx, message, replied)
             prompt = await ctx.prompt(replied, content, files)
+            session = EditSession(files.editable) if files.editable else None
             result = await self.agent.run(
-                self._system_prompt(message.guild), prompt, ctx.tools(), files.media, pick=pick
+                self._system_prompt(message.guild),
+                prompt,
+                ctx.tools() + (session.tools() if session else []),
+                files.media,
+                pick=pick,
+                workspace=session,
+                rounds=config.CHAT_MAX_EDIT_ROUNDS if session else None,
+                visual=bool(session and session.visual),
             )
+            if result is not None and session:
+                saved, failed = await session.outputs()
         if result is None:
             response, tag = "My brain is fried right now, try again in a bit 😵", None
         else:
             response, answered_by, used = result
             response = discord_md.to_discord(_fix_emojis(response, message.guild))
-            tag = _model_tag(answered_by, used, pick, pdf=any(a.mime == PDF for a in files.media))
+            # Pages of a document being edited are PDFs too.
+            pdf = any(a.mime == PDF for a in files.media) or bool(session and session.visual)
+            tag = _model_tag(answered_by, used, pick, pdf=pdf)
+            if session:
+                limit = message.guild.filesize_limit if message.guild else 10 * MB
+                too_big = [name for name, data in saved if len(data) > limit]
+                uploads = [discord.File(io.BytesIO(data), filename=name) for name, data in saved if len(data) <= limit]
+                if failed or too_big:
+                    why = [f"{n} couldn't be saved" for n in failed] + [f"{n} is too big to upload" for n in too_big]
+                    response += f"\n-# The edited {'; '.join(why)}, so it isn't attached."
 
         chunks = discord_md.split(response)
         for i, chunk in enumerate(chunks):
             send = message.reply if i == 0 else message.channel.send
             last = i == len(chunks) - 1
-            # AI output never pings anyone; the model tag goes under the last chunk.
-            await send(chunk, allowed_mentions=discord.AllowedMentions.none(), view=tag if last else None)
+            # AI output never pings anyone; the model tag and edited files go under the last chunk.
+            extra = ({"view": tag} | ({"files": uploads} if uploads else {})) if last else {}
+            await send(chunk, allowed_mentions=discord.AllowedMentions.none(), **extra)
 
 
 async def setup(bot: XiapBot) -> None:

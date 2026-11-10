@@ -7,7 +7,8 @@ from unittest.mock import AsyncMock, Mock, patch
 import discord
 from PIL import Image
 
-from xiap.cogs.chat import DOCX, ChatCog, FileReader, _docx_text, _embed_images, _to_png
+from xiap.cogs.chat import DOCX, ChatCog, FileReader, _embed_images, _to_png
+from xiap.editing import WordFile
 
 
 def gif(frames: int) -> bytes:
@@ -124,7 +125,10 @@ class FileReaderTests(unittest.IsolatedAsyncioTestCase):
 
 class DocxTests(unittest.IsolatedAsyncioTestCase):
     def test_paragraphs_tabs_breaks_and_tables(self):
-        self.assertEqual(_docx_text(REPORT), "Trip plan\nDay 1\tHike\nbring water\nWho | Pays\nBob | $20")
+        self.assertEqual(
+            WordFile("trip.docx", "Bob", REPORT).view(),
+            "[p1] Trip plan\n[p2] Day 1\tHike\nbring water\n[t1.r1] Who | Pays\n[t1.r2] Bob | $20",
+        )
 
     async def test_docx_is_pasted_as_text_and_broken_ones_are_skipped(self):
         reader = FileReader(Mock())
@@ -134,8 +138,21 @@ class DocxTests(unittest.IsolatedAsyncioTestCase):
         ])
         await reader.read(ping, "in the message that pinged you")
         self.assertEqual(len(reader.files.texts), 1)
-        self.assertIn("=== trip.docx (attached by Bob) ===\nTrip plan", reader.files.texts[0])
+        self.assertIn("=== trip.docx (attached by Bob) ===\n[p1] Trip plan", reader.files.texts[0])
         self.assertEqual((reader.files.media, reader.files.skipped), ([], ["broken.docx"]))
+        self.assertEqual([f.name for f in reader.files.editable], ["trip.docx"])
+
+    async def test_utf8_text_files_are_editable_and_same_names_are_told_apart(self):
+        reader = FileReader(Mock())
+        ping = message("Bob", attachments=[
+            attachment("notes.txt", "text/plain", b"hi"),
+            attachment("notes.txt", "text/plain", b"there"),
+            attachment("old.txt", "text/plain", b"caf\xe9"),  # Latin-1: shown, but not editable
+        ])
+        await reader.read(ping, "in the message that pinged you")
+        self.assertEqual([f.name for f in reader.files.editable], ["notes.txt", "notes (2).txt"])
+        self.assertEqual(len(reader.files.texts), 3)
+        self.assertIn("=== notes (2).txt (attached by Bob) ===\nthere", reader.files.texts[1])
 
 
 class ReadFilesTests(unittest.IsolatedAsyncioTestCase):

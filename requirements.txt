@@ -5,3 +5,5 @@ aiohttp>=3.9
 matplotlib>=3.8
 pillow>=10
 yt-dlp[default]>=2026.10
+lxml>=5.3,<7
+pypdf>=5,<7

@@ -67,8 +67,20 @@ CHAT_TEXT_MAX_CHARS = int(os.getenv("CHAT_TEXT_MAX_CHARS", "20000"))
 # pulls more with tools when it decides it needs them.
 CHAT_HISTORY_LIMIT = int(os.getenv("CHAT_HISTORY_LIMIT", "30"))
 CHAT_BASE_CONTEXT = int(os.getenv("CHAT_BASE_CONTEXT", "8"))
-# Max rounds of tool calls per reply before the model must answer.
+# Max rounds of tool calls per reply before the model must answer. Replies
+# that can edit an attached file get more rounds (edit, look at the pages,
+# fix, check the diff) and more seconds per provider.
 CHAT_MAX_TOOL_ROUNDS = int(os.getenv("CHAT_MAX_TOOL_ROUNDS", "4"))
+CHAT_MAX_EDIT_ROUNDS = int(os.getenv("CHAT_MAX_EDIT_ROUNDS", "12"))
+CHAT_EDIT_TIMEOUT = int(os.getenv("CHAT_EDIT_TIMEOUT", "600"))
+
+# Word documents are laid out as PDF pages by headless LibreOffice so Claude
+# and Gemini can see them while editing. Empty = look for `soffice` on PATH
+# (and in /Applications on a Mac); not found = editing works without pages.
+SOFFICE = os.getenv("SOFFICE", "")
+# Pages shown per look, and seconds one layout may take.
+CHAT_RENDER_PAGES = int(os.getenv("CHAT_RENDER_PAGES", "5"))
+RENDER_TIMEOUT = int(os.getenv("RENDER_TIMEOUT", "60"))
 
 # Daily papers digest: local hour to post at, and the timezone it's in.
 PAPERS_HOUR = int(os.getenv("PAPERS_HOUR", "9"))
