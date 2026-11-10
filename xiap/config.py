@@ -56,8 +56,9 @@ CHAT_IMAGE_MAX_MB = float(os.getenv("CHAT_IMAGE_MAX_MB", "5"))
 # since the cli-bridge server caps a request at 20 MB once base64'd.
 CHAT_MAX_PDFS = int(os.getenv("CHAT_MAX_PDFS", "2"))
 CHAT_PDF_MAX_MB = float(os.getenv("CHAT_PDF_MAX_MB", "10"))
-# Text files (.txt, .md, .csv, code…) are pasted into the prompt for every
-# model: up to CHAT_MAX_TEXT_FILES, each cut off after CHAT_TEXT_MAX_CHARS.
+# Text files (.txt, .md, .csv, code…) and Word documents' text are pasted into
+# the prompt for every model: up to CHAT_MAX_TEXT_FILES of each, each cut off
+# after CHAT_TEXT_MAX_CHARS.
 CHAT_MAX_TEXT_FILES = int(os.getenv("CHAT_MAX_TEXT_FILES", "3"))
 CHAT_TEXT_MAX_CHARS = int(os.getenv("CHAT_TEXT_MAX_CHARS", "20000"))
 

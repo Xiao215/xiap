@@ -4,8 +4,8 @@ Instead of dumping the whole channel history into every request, the model
 gets a small window of recent messages and tools to pull more when it needs
 it: older channel history, or a specific message (by id or link) along with
 the reply chain above it. Files on the pinging message (or the one it replies
-to) are shown to the model too: images and PDFs as-is, text files pasted into
-the prompt. Images in the recent messages are shown as well, and so are images
+to) are shown to the model too: images and PDFs as-is, text files and Word
+documents pasted into the prompt. Images in the recent messages are shown as well, and so are images
 Discord embedded from links (pasted image links, Tenor/Giphy GIFs). Everything
 it can read still obeys /context and /optout. Provider
 handling (Claude/Gemini/Cohere for everyone, key rotation,
@@ -18,8 +18,10 @@ import io
 import logging
 import os
 import re
+import zipfile
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
+from xml.etree import ElementTree
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -51,6 +53,12 @@ MB = 1024 * 1024
 MAX_INLINE_BYTES = 14 * MB
 # Text files bigger than this aren't downloaded just to be cut off.
 MAX_TEXT_BYTES = 1 * MB
+# Word documents carry their images and fonts too, so they get more room; only
+# their text is read, and a document.xml bigger than MAX_DOCX_XML is refused.
+DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+MAX_DOCX_BYTES = 10 * MB
+MAX_DOCX_XML = 20 * MB
+W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 # Image formats every image-reading provider takes; others (GIF, HEIC, BMP…)
 # are converted to PNG first.
 IMAGE_TYPES = {"image/png", "image/jpeg", "image/webp"}
@@ -123,7 +131,7 @@ one message by id or link plus the messages it replies to.
 - If a tool says something is off-limits (history turned off, someone opted out), respect that \
 and don't speculate about the hidden content.
 - Files attached to the message that pinged you (or the one it replies to) are shown to you: \
-images and PDFs directly, text files pasted in. Images in the recent messages you're shown, \
+images and PDFs directly, text files and Word documents (.docx, text only) pasted in. Images in the recent messages you're shown, \
 including ones Discord embedded from a link (`[embedded: …]`), are shown too; the prompt lists \
 which image came from whom. An animated GIF arrives as a grid of a few frames in order (left \
 to right, top to bottom); a Tenor/Giphy GIF only as one still frame. Other files only show up \
@@ -317,11 +325,13 @@ class ChatContext:
 
 
 def _kind(a: discord.Attachment) -> tuple[str, str]:
-    """("image" | "pdf" | "text" | "other", mime type) for an attachment."""
+    """("image" | "pdf" | "docx" | "text" | "other", mime type) for an attachment."""
     mime = (a.content_type or "").split(";")[0].strip().lower()
     ext = os.path.splitext(a.filename)[1].lower()
     if mime == PDF or ext == ".pdf":
         return "pdf", PDF
+    if mime == DOCX or ext == ".docx":
+        return "docx", DOCX
     if mime.startswith("image/"):
         return "image", mime
     if mime.startswith("text/") or mime in TEXT_MIMES:
@@ -337,6 +347,46 @@ def _text_section(filename: str, author: str, text: str) -> str:
     if len(text) > limit:
         text = text[:limit] + f"\n…(cut off: only the first {limit:,} of {len(text):,} characters are shown)"
     return f"=== {filename} (attached by {author}) ===\n{text}\n=== end of {filename} ==="
+
+
+def _docx_text(data: bytes) -> str:
+    """The text of a Word document: one line per paragraph, table rows as
+    cells joined by " | ". Raises on anything that isn't a readable .docx."""
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        if z.getinfo("word/document.xml").file_size > MAX_DOCX_XML:
+            raise ValueError("document.xml is too big")
+        xml = z.read("word/document.xml")
+    if b"<!DOCTYPE" in xml[:4096]:  # never in a real .docx; don't let expat expand entities
+        raise ValueError("document.xml has a DTD")
+    body = ElementTree.fromstring(xml).find(f"{W}body")
+    if body is None:
+        raise ValueError("document.xml has no body")
+
+    def paragraph(p: ElementTree.Element) -> str:
+        parts = []
+        for el in p.iter():
+            if el.tag == f"{W}t":
+                parts.append(el.text or "")
+            elif el.tag == f"{W}tab":
+                parts.append("\t")
+            elif el.tag in (f"{W}br", f"{W}cr"):
+                parts.append("\n")
+        return "".join(parts)
+
+    def block(el: ElementTree.Element) -> list[str]:
+        if el.tag == f"{W}p":
+            return [paragraph(el)]
+        if el.tag == f"{W}tbl":
+            return [
+                " | ".join(" ".join(paragraph(p) for p in tc.iter(f"{W}p")).strip() for tc in tr.findall(f"{W}tc"))
+                for tr in el.findall(f"{W}tr")
+            ]
+        if el.tag == f"{W}sdt":  # content control (e.g. a table of contents): read what's inside
+            content = el.find(f"{W}sdtContent")
+            return [line for child in (content if content is not None else []) for line in block(child)]
+        return []
+
+    return "\n".join(line for child in body for line in block(child)).strip()
 
 
 def _embed_images(msg: discord.Message) -> list[tuple[str, str, bool]]:
@@ -399,6 +449,7 @@ class FileReader:
             "image": (config.CHAT_MAX_IMAGES, config.CHAT_IMAGE_MAX_MB * MB),
             "pdf": (config.CHAT_MAX_PDFS, config.CHAT_PDF_MAX_MB * MB),
             "text": (config.CHAT_MAX_TEXT_FILES, MAX_TEXT_BYTES),
+            "docx": (config.CHAT_MAX_TEXT_FILES, MAX_DOCX_BYTES),
         }
         self.counts = dict.fromkeys(self.limits, 0)
         self.inline = 0
@@ -406,7 +457,7 @@ class FileReader:
     def _fits(self, kind: str, size: int) -> bool:
         max_count, max_bytes = self.limits.get(kind, (0, 0))
         return self.counts.get(kind, 0) < max_count and size <= max_bytes and (
-            kind == "text" or self.inline + size <= MAX_INLINE_BYTES
+            kind in ("text", "docx") or self.inline + size <= MAX_INLINE_BYTES
         )
 
     async def read(self, msg: discord.Message, where: str, *, images_only: bool = False) -> None:
@@ -438,6 +489,15 @@ class FileReader:
                     continue
                 self.files.texts.append(_text_section(a.filename, who, data.decode("utf-8", "replace")))
                 self.counts["text"] += 1
+            elif kind == "docx":
+                try:
+                    text = await asyncio.to_thread(_docx_text, data)
+                except Exception as e:  # noqa: BLE001 — bad zips and XML raise all sorts
+                    log.warning("Couldn't read Word document %s: %s", a.filename, e)
+                    skip(a.filename)
+                    continue
+                self.files.texts.append(_text_section(a.filename, who, text))
+                self.counts["docx"] += 1
             elif kind == "pdf":
                 if not self._add(Attachment(mime, data, a.filename), f"{a.filename}, attached by {who} {where}"):
                     skip(a.filename)

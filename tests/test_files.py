@@ -1,12 +1,13 @@
 import io
 import unittest
+import zipfile
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import discord
 from PIL import Image
 
-from xiap.cogs.chat import ChatCog, FileReader, _embed_images, _to_png
+from xiap.cogs.chat import DOCX, ChatCog, FileReader, _docx_text, _embed_images, _to_png
 
 
 def gif(frames: int) -> bytes:
@@ -20,6 +21,25 @@ def png() -> bytes:
     out = io.BytesIO()
     Image.new("RGB", (10, 10)).save(out, "PNG")
     return out.getvalue()
+
+
+def docx(body: str) -> bytes:
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w") as z:
+        z.writestr("word/document.xml", (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+            f"<w:body>{body}<w:sectPr/></w:body></w:document>"
+        ))
+    return out.getvalue()
+
+
+REPORT = docx(
+    "<w:p><w:r><w:t>Trip </w:t></w:r><w:r><w:t>plan</w:t></w:r></w:p>"
+    "<w:p><w:r><w:t>Day 1</w:t><w:tab/><w:t>Hike</w:t><w:br/><w:t>bring water</w:t></w:r></w:p>"
+    "<w:tbl><w:tr><w:tc><w:p><w:r><w:t>Who</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>Pays</w:t></w:r></w:p></w:tc></w:tr>"
+    "<w:tr><w:tc><w:p><w:r><w:t>Bob</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>$20</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"
+)
 
 
 def attachment(filename: str, mime: str, data: bytes) -> SimpleNamespace:
@@ -100,6 +120,22 @@ class FileReaderTests(unittest.IsolatedAsyncioTestCase):
         await reader.read(ping, "in the message that pinged you")
         self.assertEqual(len(reader.files.media), 1)
         self.assertEqual(reader.files.skipped, ["b.png"])
+
+
+class DocxTests(unittest.IsolatedAsyncioTestCase):
+    def test_paragraphs_tabs_breaks_and_tables(self):
+        self.assertEqual(_docx_text(REPORT), "Trip plan\nDay 1\tHike\nbring water\nWho | Pays\nBob | $20")
+
+    async def test_docx_is_pasted_as_text_and_broken_ones_are_skipped(self):
+        reader = FileReader(Mock())
+        ping = message("Bob", attachments=[
+            attachment("trip.docx", DOCX, REPORT),
+            attachment("broken.docx", "application/octet-stream", b"not a zip"),
+        ])
+        await reader.read(ping, "in the message that pinged you")
+        self.assertEqual(len(reader.files.texts), 1)
+        self.assertIn("=== trip.docx (attached by Bob) ===\nTrip plan", reader.files.texts[0])
+        self.assertEqual((reader.files.media, reader.files.skipped), ([], ["broken.docx"]))
 
 
 class ReadFilesTests(unittest.IsolatedAsyncioTestCase):
