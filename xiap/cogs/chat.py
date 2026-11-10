@@ -3,10 +3,11 @@
 Instead of dumping the whole channel history into every request, the model
 gets a small window of recent messages and tools to pull more when it needs
 it: older channel history, or a specific message (by id or link) along with
-the reply chain above it. Files on the pinging message (or the one it replies
-to) are shown to the model too: images and PDFs as-is, text files and Word
-documents pasted into the prompt. Images in the recent messages are shown as well, and so are images
-Discord embedded from links (pasted image links, Tenor/Giphy GIFs). Everything
+the reply chain above it. Files on the pinging message, the one it replies
+to and the recent messages are shown to the model too: images and PDFs as-is,
+text files and Word documents pasted into the prompt. So are images Discord
+embedded from links (pasted image links, Tenor/Giphy GIFs). Files further back
+come along with get_message when the model fetches their message. Everything
 it can read still obeys /context and /optout. Provider
 handling (Claude/Gemini/Cohere for everyone, key rotation,
 failover, PDF-capable models first) lives in xiap.llm.
@@ -32,7 +33,7 @@ from PIL import Image
 
 from xiap import config, discord_md
 from xiap.bot import XiapBot
-from xiap.llm import PDF, Agent, Attachment, Tool, reads_pdfs
+from xiap.llm import PDF, Agent, Attachment, Tool, ToolResult, reads_pdfs, truncate
 from xiap.store import store
 
 log = logging.getLogger(__name__)
@@ -134,12 +135,16 @@ guessing.
 one message by id or link plus the messages it replies to.
 - If a tool says something is off-limits (history turned off, someone opted out), respect that \
 and don't speculate about the hidden content.
-- Files attached to the message that pinged you (or the one it replies to) are shown to you: \
-images and PDFs directly, text files and Word documents (.docx, text only) pasted in. Images in the recent messages you're shown, \
-including ones Discord embedded from a link (`[embedded: …]`), are shown too; the prompt lists \
-which image came from whom. An animated GIF arrives as a grid of a few frames in order (left \
-to right, top to bottom); a Tenor/Giphy GIF only as one still frame. Other files only show up \
-as names in `[attached: …]`, and you can't open them.
+- Files attached to the message that pinged you, the one it replies to and the recent \
+messages you're shown are shown to you, within a few per ping: images and PDFs directly, \
+text files and Word documents (.docx, text only) pasted in. So are images Discord embedded \
+from a link (`[embedded: …]`). The prompt lists which file came from whom. An animated GIF \
+arrives as a grid of a few frames in order (left to right, top to bottom); a Tenor/Giphy GIF \
+only as one still frame.
+- A file you only see as a name in `[attached: …; message id …]` — further back, or past \
+the per-ping limit — can usually still be opened: call `get_message` with that message id \
+and its files come back with the result. Do that before saying you can't see a file \
+someone is asking about. Other file types (audio, video, zips…) can't be opened.
 
 ### Your features
 - Besides chatting, you have slash commands. When someone asks what you can do or how to use \
@@ -163,6 +168,8 @@ class ChatContext:
         self.limit = store.get_context_limit(self.channel.id, config.CHAT_HISTORY_LIMIT)
         self._history: list[discord.Message] = []  # newest first, unfiltered
         self._fetched = 0  # how many messages back we've asked Discord for
+        # Set once the ping's files are read; get_message adds files within what's left of its limits.
+        self.reader: FileReader | None = None
 
     def readable(self, msg: discord.Message, *, other_bots: bool = False) -> bool:
         if msg.author == self.bot.user:
@@ -183,7 +190,7 @@ class ChatContext:
             line += f" (replying to {who}, message id {ref.message_id})"
         line += f": {msg.clean_content.strip()}"
         if msg.attachments:
-            line += f" [attached: {', '.join(a.filename for a in msg.attachments)}]"
+            line += f" [attached: {', '.join(a.filename for a in msg.attachments)}; message id {msg.id}]"
         if images := _embed_images(msg):
             line += f" [embedded: {', '.join(name for _, name, _ in images)}]"
         if titles := [e.title for e in msg.embeds if e.title]:
@@ -240,19 +247,7 @@ class ChatContext:
         author = self.message.author.display_name
         if replied is not None:
             sections.append(f"{author} is replying to this message:\n{self.format(replied)}")
-        files = files or Files()
-        if files.labels:
-            sections.append(
-                "Images and PDFs shown to you, in order:\n"
-                + "\n".join(f"{i}. {label}" for i, label in enumerate(files.labels, 1))
-            )
-        if files.texts:
-            sections.append("Attached text files:\n\n" + "\n\n".join(files.texts))
-        if files.skipped:
-            sections.append(
-                f"(You can't see these attached files — too big, too many, or a type you can't "
-                f"read: {', '.join(files.skipped)}. Don't pretend to know what's in them.)"
-            )
+        sections += (files or Files()).sections()
         if content:
             sections.append(f"{author} says to you: {content}")
         elif replied is not None:
@@ -313,9 +308,12 @@ class ChatContext:
 
         msg = await channel.fetch_message(message_id)
         chain: list[str] = []
+        files = Files()
         for _ in range(MAX_REPLY_CHAIN):
             if self.readable(msg, other_bots=True):
                 chain.append(self.format(msg))
+                if self.reader is not None:
+                    await self.reader.read_into(files, msg, f"in message {msg.id}")
             else:
                 chain.append(f"(hidden: {msg.author.display_name} opted out of AI context)")
             ref = msg.reference
@@ -325,7 +323,8 @@ class ChatContext:
             msg = parent or await channel.fetch_message(ref.message_id)
         where = f" in #{channel.name}" if getattr(channel, "name", None) else ""
         header = f"The message{where}" + (", preceded by the messages it replies to" if len(chain) > 1 else "")
-        return f"{header} (oldest first):\n" + "\n".join(reversed(chain))
+        text = truncate(f"{header} (oldest first):\n" + "\n".join(reversed(chain)))
+        return ToolResult("\n\n".join([text, *files.sections(shown="with this result")]), files.media)
 
     def tools(self) -> list[Tool]:
         tools = [
@@ -333,7 +332,9 @@ class ChatContext:
                 name="get_message",
                 description=(
                     "Fetch one Discord message by its id (in this channel) or by a message link, "
-                    f"together with up to {MAX_REPLY_CHAIN} messages above it in its reply chain."
+                    f"together with up to {MAX_REPLY_CHAIN} messages above it in its reply chain. "
+                    "Files attached to them that you haven't been shown (PDFs, images, text and "
+                    "Word files) come back with the result, as many as the per-ping limits allow."
                 ),
                 parameters={
                     "type": "object",
@@ -478,6 +479,23 @@ class Files:
     texts: list[str] = field(default_factory=list)  # text files, as prompt sections
     skipped: list[str] = field(default_factory=list)  # names of files it won't get
 
+    def sections(self, shown: str = "") -> list[str]:
+        """Prompt sections saying what's in here; `shown` says where the media is."""
+        sections = []
+        if self.labels:
+            sections.append(
+                f"Images and PDFs shown to you{' ' + shown if shown else ''}, in order:\n"
+                + "\n".join(f"{i}. {label}" for i, label in enumerate(self.labels, 1))
+            )
+        if self.texts:
+            sections.append("Attached text files:\n\n" + "\n\n".join(self.texts))
+        if self.skipped:
+            sections.append(
+                f"(You can't see these attached files — too big, too many, or a type you can't "
+                f"read: {', '.join(self.skipped)}. Don't pretend to know what's in them.)"
+            )
+        return sections
+
 
 class FileReader:
     """Collects files from messages, in order, within the count/size limits."""
@@ -493,6 +511,8 @@ class FileReader:
         }
         self.counts = dict.fromkeys(self.limits, 0)
         self.inline = 0
+        self.seen: set[int] = set()  # ids of messages whose files were looked at
+        self.taken: set[tuple[int, str]] = set()  # (message id, name) of files already added
 
     def _fits(self, kind: str, size: int) -> bool:
         max_count, max_bytes = self.limits.get(kind, (0, 0))
@@ -500,19 +520,20 @@ class FileReader:
             kind in ("text", "docx") or self.inline + size <= MAX_INLINE_BYTES
         )
 
-    async def read(self, msg: discord.Message, where: str, *, images_only: bool = False) -> None:
-        """Add the files on `msg`. With images_only (for messages further up the
-        chat) other files are left out, and so are images over the limits,
-        without listing them as skipped: the chat log already names them."""
+    async def read(self, msg: discord.Message, where: str, *, quiet: bool = False) -> None:
+        """Add the files on `msg`. With quiet (for messages further up the chat)
+        files it can't take aren't listed as skipped: the chat log already names
+        them, and the model can still ask for them with get_message."""
+        self.seen.add(msg.id)
         who = msg.author.display_name
 
         def skip(name: str) -> None:
-            if not images_only:
+            if not quiet:
                 self.files.skipped.append(name)
 
         for a in msg.attachments:
             kind, mime = _kind(a)
-            if images_only and kind != "image":
+            if (msg.id, a.filename) in self.taken or (quiet and kind == "other"):
                 continue
             if not self._fits(kind, a.size):
                 skip(a.filename)
@@ -529,6 +550,7 @@ class FileReader:
                     continue
                 self.files.texts.append(_text_section(a.filename, who, data.decode("utf-8", "replace")))
                 self.counts["text"] += 1
+                self.taken.add((msg.id, a.filename))
             elif kind == "docx":
                 try:
                     text = await asyncio.to_thread(_docx_text, data)
@@ -538,19 +560,38 @@ class FileReader:
                     continue
                 self.files.texts.append(_text_section(a.filename, who, text))
                 self.counts["docx"] += 1
+                self.taken.add((msg.id, a.filename))
             elif kind == "pdf":
-                if not self._add(Attachment(mime, data, a.filename), f"{a.filename}, attached by {who} {where}"):
+                if self._add(Attachment(mime, data, a.filename), f"{a.filename}, attached by {who} {where}"):
+                    self.taken.add((msg.id, a.filename))
+                else:
                     skip(a.filename)
-            elif not await self._add_image(data, mime, a.filename, f"attached by {who} {where}"):
+            elif await self._add_image(data, mime, a.filename, f"attached by {who} {where}"):
+                self.taken.add((msg.id, a.filename))
+            else:
                 skip(a.filename)
 
         for url, name, gifv in _embed_images(msg):
+            if (msg.id, name) in self.taken:
+                continue
             if not self._fits("image", 0):
                 break
             got = await self._download(url, int(self.limits["image"][1]))
             how = f"linked by {who} {where}" + (" (a GIF, shown as one still frame)" if gifv else "")
-            if got is None or not await self._add_image(*got, name, how):
+            if got is not None and await self._add_image(*got, name, how):
+                self.taken.add((msg.id, name))
+            else:
                 skip(name)
+
+    async def read_into(self, files: Files, msg: discord.Message, where: str) -> None:
+        """Add the files on `msg` to `files` instead, within what's left of the
+        limits: ones that weren't added yet, such as a recent message's PDF that
+        didn't fit with the ping's own files."""
+        self.files, saved = files, self.files
+        try:
+            await self.read(msg, where)
+        finally:
+            self.files = saved
 
     async def _download(self, url: str, max_bytes: int) -> tuple[bytes, str] | None:
         """(data, mime type) of an image from Discord's media proxy, or None."""
@@ -704,9 +745,9 @@ class ChatCog(commands.Cog):
         message: discord.Message,
         replied: discord.Message | None,
         lead_in: list[discord.Message] = (),
-    ) -> Files:
+    ) -> FileReader:
         """Files on the ping, the message it replies to and a bare ping's lead-in
-        messages, then images further up the chat."""
+        messages, then on the recent messages further up the chat, newest first."""
         # A pasted link's embed (an image link, a Tenor GIF) usually lands a
         # moment after the message itself.
         links = [u for u in EMBED_LINK_RE.findall(message.content) if not MESSAGE_LINK_RE.search(u)]
@@ -722,11 +763,10 @@ class ChatCog(commands.Cog):
         for msg in lead_in:
             await reader.read(msg, "just before pinging you")
         if ctx.limit > 0:
-            seen = {m.id for m in lead_in} | ({replied.id} if replied is not None else set())
             for msg in reversed(await ctx.recent(config.CHAT_BASE_CONTEXT)):  # newest first
-                if msg.id not in seen:
-                    await reader.read(msg, "earlier in the chat", images_only=True)
-        return reader.files
+                if msg.id not in reader.seen:
+                    await reader.read(msg, "earlier in the chat", quiet=True)
+        return reader
 
     async def _answer(self, message: discord.Message, replied: discord.Message | None, content: str) -> None:
         ctx = ChatContext(self.bot, message)
@@ -743,7 +783,8 @@ class ChatCog(commands.Cog):
             return
         pick = store.get_model_pick(message.author.id)
         async with message.channel.typing():
-            files = await self._read_files(ctx, message, replied, lead_in)
+            ctx.reader = await self._read_files(ctx, message, replied, lead_in)
+            files = ctx.reader.files
             prompt = await ctx.prompt(replied, content, files, lead_in)
             result = await self.agent.run(
                 self._system_prompt(message.guild), prompt, ctx.tools(), files.media, pick=pick
@@ -753,7 +794,8 @@ class ChatCog(commands.Cog):
         else:
             response, answered_by, used = result
             response = discord_md.to_discord(_fix_emojis(response, message.guild))
-            tag = _model_tag(answered_by, used, pick, pdf=any(a.mime == PDF for a in files.media))
+            # Counts PDFs get_message brought in too.
+            tag = _model_tag(answered_by, used, pick, pdf=ctx.reader.counts["pdf"] > 0)
 
         chunks = discord_md.split(response)
         for i, chunk in enumerate(chunks):

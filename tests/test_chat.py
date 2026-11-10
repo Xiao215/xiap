@@ -3,7 +3,8 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
-from xiap.cogs.chat import ChatCog, ChatContext
+from xiap.cogs.chat import ChatCog, ChatContext, FileReader
+from xiap.llm import ToolResult
 
 NOW = datetime(2026, 11, 9, 18, 55, tzinfo=timezone.utc)
 BOT = SimpleNamespace(id=1, display_name="xiap", bot=True)
@@ -74,6 +75,26 @@ class LeadInTests(unittest.IsolatedAsyncioTestCase):
         prompt = await ctx.prompt(message(AMY, "is this legit?"), "")
         self.assertIn("Will is replying to this message:\n[", prompt)
         self.assertIn("pinged you with just an @mention on the message they're replying to", prompt)
+
+
+class GetMessageTests(unittest.IsolatedAsyncioTestCase):
+    async def test_brings_back_files_on_the_fetched_message(self):
+        pdf = SimpleNamespace(filename="方案.pdf", content_type="application/pdf", size=8, read=AsyncMock(return_value=b"%PDF-1.7"))
+        old = message(WILL, "here's the plan", minutes_ago=30, id=7)
+        old.attachments = [pdf]
+        ctx = context([old])
+        ctx.channel.fetch_message = AsyncMock(return_value=old)
+        ctx.reader = FileReader(Mock())
+        with patch("xiap.cogs.chat.store.get_context_limit", return_value=30):
+            result = await ctx.get_message("7")
+        self.assertIsInstance(result, ToolResult)
+        self.assertIn("[attached: 方案.pdf; message id 7]", result.text)
+        self.assertIn("1. 方案.pdf, attached by Will in message 7", result.text)
+        self.assertEqual([a.filename for a in result.media], ["方案.pdf"])
+
+        # Asked again, it isn't sent twice.
+        with patch("xiap.cogs.chat.store.get_context_limit", return_value=30):
+            self.assertEqual((await ctx.get_message("7")).media, [])
 
 
 class BarePingTests(unittest.IsolatedAsyncioTestCase):

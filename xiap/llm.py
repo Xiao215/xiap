@@ -12,7 +12,9 @@ round-robins across its configured API keys. All configured providers are
 available to everyone. Cohere can't read PDFs, so
 when one is attached, providers that can read it go first. If a provider fails
 outright, or takes longer than its deadline, the whole run restarts on the
-next. Tools are read-only, so re-running them on failover is harmless.
+next. Tools are read-only, so re-running them on failover is harmless. A tool
+can hand back images and PDFs along with its text (get_message does, for the
+files on the messages it fetches).
 """
 
 import asyncio
@@ -22,7 +24,7 @@ import json
 import logging
 import time
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import aiohttp
@@ -62,11 +64,20 @@ class Attachment:
 
 
 @dataclass
+class ToolResult:
+    """What a tool hands back: text, plus any images or PDFs to show the model."""
+
+    text: str
+    media: list[Attachment] = field(default_factory=list)
+
+
+@dataclass
 class Tool:
     name: str
     description: str
     parameters: dict  # JSON schema for the arguments object
-    run: Callable[..., Awaitable[str]]
+    # A plain str is cut to MAX_TOOL_RESULT_CHARS; a ToolResult keeps its own size in check.
+    run: Callable[..., Awaitable[str | ToolResult]]
 
 
 def reads_pdfs(label: str) -> bool:
@@ -98,6 +109,26 @@ def _bridge_headers() -> dict[str, str]:
     return headers
 
 
+def truncate(text: str) -> str:
+    """Tool output cut to MAX_TOOL_RESULT_CHARS so one call can't blow up the prompt."""
+    if len(text) > MAX_TOOL_RESULT_CHARS:
+        return text[:MAX_TOOL_RESULT_CHARS] + "\n…(truncated)"
+    return text
+
+
+def _media_blocks(attachments: list[Attachment]) -> list[dict]:
+    """Anthropic content blocks for the images and PDFs cli-bridge takes."""
+    return [
+        {
+            "type": "document" if a.mime == PDF else "image",
+            "source": {"type": "base64", "media_type": a.mime, "data": a.b64()},
+            **({"title": a.filename} if a.mime == PDF and a.filename else {}),
+        }
+        for a in attachments
+        if a.mime in BRIDGE_TYPES
+    ]
+
+
 def _attachment_note(attachments: list[Attachment], supported: set[str]) -> str:
     """Tell the model about attached files it won't be able to see."""
     skipped = [a for a in attachments if a.mime not in supported]
@@ -127,18 +158,20 @@ class KeyRing:
         return ordered
 
 
-async def _run_tool(tools: dict[str, Tool], name: str, args: dict) -> str:
+async def _run_tool(tools: dict[str, Tool], name: str, args: dict) -> ToolResult:
     tool = tools.get(name)
     if tool is None:
-        return f"Error: unknown tool {name!r}"
+        return ToolResult(f"Error: unknown tool {name!r}")
     log.info("Tool call: %s(%s)", name, json.dumps(args, ensure_ascii=False))
     try:
         result = await tool.run(**args)
     except Exception as e:  # noqa: BLE001 — report tool errors back to the model
         log.warning("Tool %s failed: %s", name, e)
         result = f"Error: {e}"
-    if len(result) > MAX_TOOL_RESULT_CHARS:
-        result = result[:MAX_TOOL_RESULT_CHARS] + "\n…(truncated)"
+    if isinstance(result, str):
+        result = ToolResult(truncate(result))
+    if result.media:
+        log.info("Tool %s shows %s", name, ", ".join(a.filename or a.mime for a in result.media))
     return result
 
 
@@ -321,7 +354,8 @@ class Agent:
             for call in msg.tool_calls:
                 args = json.loads(call.function.arguments or "{}")
                 result = await _run_tool(tools, call.function.name, args)
-                messages.append({"role": "tool", "tool_call_id": call.id, "content": json.dumps({"result": result})})
+                text = result.text + _attachment_note(result.media, set())
+                messages.append({"role": "tool", "tool_call_id": call.id, "content": json.dumps({"result": text})})
         raise RuntimeError("no answer after tool rounds")
 
     # --- Claude and Gemini (via the configured cli-bridge server) -------------
@@ -346,15 +380,7 @@ class Agent:
     ) -> tuple[str, str]:
         """`default` is sent when no model is chosen; empty = the server's default."""
         model = model or default
-        content: list[dict] = [
-            {
-                "type": "document" if a.mime == PDF else "image",
-                "source": {"type": "base64", "media_type": a.mime, "data": a.b64()},
-                **({"title": a.filename} if a.mime == PDF and a.filename else {}),
-            }
-            for a in attachments
-            if a.mime in BRIDGE_TYPES
-        ]
+        content = _media_blocks(attachments)
         content.append({"type": "text", "text": prompt + _attachment_note(attachments, BRIDGE_TYPES)})
         messages: list[dict] = [{"role": "user", "content": content}]
         specs = [
@@ -384,6 +410,11 @@ class Agent:
             results = []
             for call in calls:
                 result = await _run_tool(tools, call["name"], call.get("input") or {})
-                results.append({"type": "tool_result", "tool_use_id": call["id"], "content": result})
+                text = result.text + _attachment_note(result.media, BRIDGE_TYPES)
+                results.append({
+                    "type": "tool_result",
+                    "tool_use_id": call["id"],
+                    "content": [*_media_blocks(result.media), {"type": "text", "text": text}] if result.media else text,
+                })
             messages.append({"role": "user", "content": results})
         raise RuntimeError("no answer after tool rounds")
